@@ -1,21 +1,32 @@
 # 🌐 SuperCortex Flow
 
-**A privacy-preserving, decentralized append-only pub/sub messaging system with unguessable addressing**
+**A privacy-preserving, decentralized append-only pub/sub messaging system with unguessable 256-bit addressing**
 
 SuperCortex Flow is a proof-of-concept implementation of a revolutionary messaging paradigm that combines **BitTorrent-style decentralization** with **Signal-level privacy**, using novel cryptographic addressing to enable private, scalable communication without central control.
 
 ## 🎯 Vision: Global Decentralized Messaging
 
-### Core Innovation: Unguessable Message IDs
-- Messages addressed by **128+ bit unguessable IDs** (not topics like "sports" or "news")
-- **Prefix-based subscriptions** with proof-of-knowledge requirements
+### Core Innovation: 256-bit Unguessable Message IDs
+- Messages addressed by **256-bit unguessable IDs** with hierarchical structure
+- **Organization isolation** with random 64-bit org IDs
+- **Topic-based subscriptions** with cryptographic nonces
 - **No enumeration attacks** - you can't discover messages without prior knowledge
-- **Privacy-first**: Only those with partial ID knowledge can subscribe to related messages
+- **Privacy-first**: Only those with topic access can subscribe to related messages
 
 ### Privacy Model
 ```
 Traditional:  Subscribe to "bitcoin" → Everyone sees your interest
-SuperCortex:  Subscribe to prefix "6973616163000000" → Requires proving you know a real message ID
+SuperCortex:  Subscribe to "a7f3d89c2b1e4068.3f8a2b1c.d9e7f6a2" → Requires cryptographic proof
+```
+
+### 256-bit Address Structure
+```
+┌─────────────┬─────────────┬─────────────┬─────────────────┐
+│ 64-bit      │ 32-bit      │ 32-bit      │ 128-bit         │
+│ random org  │ topic hash  │ topic nonce │ random          │
+└─────────────┴─────────────┴─────────────┴─────────────────┘
+
+Example: a7f3d89c2b1e4068.3f8a2b1c.d9e7f6a2.{128-bit-collision-resistant}
 ```
 
 ### Full Vision Features
@@ -31,10 +42,14 @@ SuperCortex:  Subscribe to prefix "6973616163000000" → Requires proving you kn
 **Status**: Localhost development prototype implementing core concepts
 
 ### What's Working Now
-- ✅ **Event ingestion** with unguessable 128-bit IDs
-- ✅ **Prefix-based filtering** with 64-bit mandatory padding
+- ✅ **256-bit event addressing** with org + topic + cryptographic nonces
+- ✅ **Organization management** with random IDs and local aliases
+- ✅ **Topic-based messaging** with hierarchical structure
+- ✅ **Real-time WebSocket streaming** for instant event delivery
+- ✅ **Cryptographic topic isolation** - can't guess other topics
+- ✅ **Selective topic sharing** without revealing org structure
+- ✅ **Netcat-style streaming** for automation and scripting
 - ✅ **Token-based authentication** and agent management
-- ✅ **Real-time prefix watching** via CLI
 - ✅ **Binary-safe message bodies** with base64 encoding
 - ✅ **PostgreSQL persistence** for development testing
 
@@ -43,6 +58,8 @@ SuperCortex:  Subscribe to prefix "6973616163000000" → Requires proving you kn
 ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
 │   CLI Tool      │    │  FastAPI Backend │    │   PostgreSQL    │
 │   `flow`        │◄──►│  Port 2222       │◄──►│   Database      │
+│  256-bit IDs    │    │  WebSocket +     │    │  Binary Events  │
+│  Topic Mgmt     │    │  HTTP REST API   │    │                 │
 └─────────────────┘    └──────────────────┘    └─────────────────┘
 ```
 
@@ -58,69 +75,134 @@ docker compose up -d
 make install-cli-only
 ```
 
-### 3. Authentication & Basic Usage
+### 3. Setup & Authentication
 ```bash
 # Login with interactive prompts
 flow login
 # Server URL [http://localhost:2222]: 
-# Token: [hidden input]
+# Token: admin_bootstrap_token_change_me
 
-# Create a new agent (gets its own token)
-flow agent create
-
-# Add events with prefix-based addressing
-flow add "Hello world!" -p isaac
-flow add "Secret message" -p alice
-
-# Watch for events matching a prefix (requires 64-bit minimum)
-flow watch isaac     # Watches for events with "isaac" prefix
-flow watch alice     # Watches for events with "alice" prefix
+# Create your organization (gets random 64-bit ID)
+flow config create-org --alias "my-backend"
+# ✓ Created organization: a7f3d89c2b1e4068 (alias: my-backend)
+# ✓ Set as default organization
+#   Token: eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...
+#   Topic Key: f3a8d2c1e9b70456...
 ```
 
-### 4. Understanding Prefix-Based Addressing
+### 4. Topic-Based Messaging
 ```bash
-# When you add an event with prefix "isaac":
-flow add "test" -p isaac
-# ✓ Event added (prefix: isaac): 6973616163000000474854190288ec9f
+# Send events to specific topics
+flow add "Database connection failed" --topic logs.errors
+flow add "User john@example.com logged in" --topic auth.success
+flow add "Payment processed: $129.99" --topic payments.completed
 
-# The ID starts with padded prefix: 6973616163000000 (isaac + null padding)
-# Only those who know to watch "isaac" will see this event
-# No one can discover this by scanning - they need prior knowledge
+# Watch topics in real-time (WebSocket streaming)
+flow watch logs.errors      # Only database error logs
+flow watch auth             # All authentication events  
+flow watch payments         # All payment events
 ```
 
-## 🔧 Components
-
-### Backend (FastAPI)
-- **Event ingestion API** with 128-bit ID generation
-- **Prefix-based filtering** with mandatory 64-bit padding
-- **Agent authentication** system
-- **Real-time event watching** endpoints
-
-### CLI (`flow` command)
+### 5. Share Topics Securely
 ```bash
-flow login                      # Interactive login (prompts for server & token)
-flow agent create               # Create new agent (admin only)
-flow add "message" -p <prefix>  # Add event with optional prefix
-flow watch <prefix>             # Real-time prefix-based filtering
-flow get <event_id>             # Retrieve specific event
+# Generate shareable prefix for specific topic
+flow share-topic logs.errors
+# ✓ Shareable prefix for 'logs.errors':
+#   a7f3d89c2b1e40683f8a2b1cd9e7f6a2
+
+# Recipients can watch your shared topic
+flow watch a7f3d89c2b1e40683f8a2b1cd9e7f6a2
+# They can ONLY see logs.errors events, nothing else
 ```
 
-### Python Library
-```python
-from supercortex_flow import FlowClient
+## 🔧 Advanced Usage
 
-client = FlowClient(token="your_token")
-result = client.add_event("Hello from Python!")
-agent = client.create_agent()  # Get new agent ID and token
+### Organization Management
+```bash
+# View current configuration
+flow config show
+# Current configuration:
+#   Server: http://localhost:2222
+#   Default Org: a7f3d89c2b1e4068
+#   Org Aliases:
+#     my-backend: a7f3d89c2b1e4068
+#     frontend: e2a6b9d4f1c87053
+
+# Create additional orgs with aliases
+flow config create-org --alias "frontend"
+flow config create-org --alias "mobile-app"
+
+# Switch between organizations
+flow config set-org frontend
 ```
 
-## 🔐 Security Model
+### Netcat-Style Streaming
+```bash
+# Stream raw event bodies to stdout (perfect for piping)
+flow nc -l logs.errors | grep "timeout" | logger -t "flow-alerts"
+
+# Send continuous input as events
+tail -f /var/log/app.log | flow nc logs.events
+echo "System startup complete" | flow nc system.status
+
+# Real-time log processing pipeline
+flow nc -l sensor.temperature | \
+  jq 'select(.temp > 85)' | \
+  flow nc alerts.overheating
+```
+
+### Cross-Organization Communication
+```bash
+# Alice shares her error logs
+alice$ flow share-topic backend.errors
+# Share: a7f3d89c.8f2a1b3c.d9e7f6a2
+
+# Bob monitors Alice's errors
+bob$ flow watch a7f3d89c.8f2a1b3c.d9e7f6a2
+# Bob can ONLY see backend.errors, not alice's other topics
+
+# Alice continues using simple syntax
+alice$ flow add "Redis connection timeout" --topic backend.errors
+alice$ flow watch backend       # All backend events
+```
+
+### Automation & Scripting
+```bash
+# Microservice error monitoring
+#!/bin/bash
+flow nc -l services.errors | while read error; do
+  echo "$(date): $error" >> /var/log/flow-errors.log
+  if echo "$error" | grep -q "CRITICAL"; then
+    mail -s "Critical Error" admin@company.com <<< "$error"
+  fi
+done
+
+# IoT sensor data collection
+#!/bin/bash
+while true; do
+  temp=$(sensors | awk '/Core 0/ {print $3}' | tr -d '+°C')
+  echo "{\"temperature\": $temp, \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" | \
+    flow nc sensors.temperature
+  sleep 30
+done
+```
+
+## 🔒 Security Model
+
+### 256-bit Privacy Protection
+```
+Your Org: a7f3d89c2b1e4068  (64-bit random - unguessable)
+├── logs.errors  → 3f8a2b1c.d9e7f6a2  (unique nonce per topic)
+├── auth.login   → 8c4a1f9e.5b2d8a7c  (can't guess from other topics)
+└── payments.*   → 9e2f7d1a.3c8f2b4e  (cryptographically isolated)
+```
 
 ### Current PoC Security
+- **Random organization IDs** prevent org enumeration
+- **Cryptographic topic nonces** prevent topic guessing
+- **Selective sharing** - share specific topics without revealing org structure
+- **No event listing** - you can only access events by computed prefix
 - **Token-based authentication** for development
-- **64-bit minimum prefix length** prevents broad scanning
-- **Unguessable IDs** prevent message enumeration
-- **No event listing** - you can only access events by ID or prefix watch
 
 ### Full Vision Security
 - **Zero-knowledge proofs** for subscription requests
@@ -132,19 +214,33 @@ agent = client.create_agent()  # Get new agent ID and token
 ## 🎯 Use Cases
 
 ### Privacy-Critical Communication
-- **Whistleblower networks** - Sources can share via unguessable IDs
-- **Activist coordination** - Organizing without revealing participant lists
-- **Corporate intelligence** - Sharing sensitive information with verified recipients
+```bash
+# Whistleblower networks - Sources share via unguessable topic IDs
+source$ flow share-topic evidence.corruption
+# Share: 3d7a9f2c1b8e5047.a2f8d1c9.e7b6a3f5
+
+recipient$ flow nc -l 3d7a9f2c1b8e5047.a2f8d1c9.e7b6a3f5 | gpg --encrypt
+```
 
 ### Decentralized Applications
-- **Private social networks** - No company can deplatform or surveil
-- **Distributed marketplaces** - Trading without central oversight
-- **IoT device coordination** - Sensors sharing data without central aggregation
+```bash
+# Private social networks - No company can deplatform or surveil
+flow add "Meeting at 3pm in room 204" --topic group.private-chat
+flow share-topic group.announcements  # Share with new members
 
-### Research & Development
-- **Privacy protocol research** - Testing new cryptographic approaches
-- **Decentralized systems** - Building mesh networks and DHT overlays
-- **Anti-surveillance technology** - Developing censorship-resistant communication
+# IoT device coordination - Sensors sharing data without central aggregation
+flow nc -l home.sensors | jq '.temperature' | flow nc weather.indoor-temp
+```
+
+### Development & Monitoring
+```bash
+# Microservice debugging across teams
+flow share-topic backend.database-errors  # Share with DBA team
+flow share-topic frontend.api-errors      # Share with API team
+
+# Real-time deployment monitoring
+flow nc -l deploy.production | grep "ERROR" | slack-notify
+```
 
 ## 🔬 Development
 
@@ -159,16 +255,66 @@ make build              # Build Docker images
 make up                 # Start services  
 make down               # Stop services
 make logs               # View backend logs
-make test-flow          # Test basic CLI workflow
+make install-cli-only   # Install CLI tools
+```
+
+### Testing the System
+```bash
+# Terminal 1: Watch events
+flow config create-org --alias test
+flow watch logs.errors
+
+# Terminal 2: Send events
+flow add "Test error message" --topic logs.errors
+flow add "Another test" --topic logs.debug
+
+# Terminal 3: Netcat streaming
+echo "Streaming test" | flow nc logs.stream
+flow nc -l logs.stream
+```
+
+## 🎨 CLI Reference
+
+### Configuration Commands
+```bash
+flow config create-org [--alias NAME]    # Create new organization
+flow config show                         # Show current config
+flow config set-org ALIAS               # Switch default org
+```
+
+### Messaging Commands
+```bash
+flow add MESSAGE [--topic PATH]         # Send event to topic
+flow watch TOPIC_OR_PREFIX              # Watch events (WebSocket)
+flow watch TOPIC --poll                 # Watch events (polling fallback)
+flow get EVENT_ID                       # Retrieve specific event
+```
+
+### Sharing Commands
+```bash
+flow share-topic TOPIC [--copy]         # Generate shareable prefix
+```
+
+### Netcat Commands
+```bash
+flow nc -l TOPIC_OR_PREFIX              # Stream event bodies to stdout
+flow nc TOPIC                           # Send stdin as events
+```
+
+### Legacy Commands
+```bash
+flow agent create                       # Create agent (admin only)
+flow login                             # Interactive login
 ```
 
 ## 🚧 Roadmap to Full Vision
 
 ### Phase 1: Core Protocol (Current)
-- [x] Unguessable ID generation
-- [x] Prefix-based filtering
-- [x] Basic authentication
-- [x] RESTful API design
+- [x] 256-bit unguessable ID generation
+- [x] Organization + topic-based addressing
+- [x] Cryptographic topic isolation
+- [x] Real-time WebSocket streaming
+- [x] Selective topic sharing
 
 ### Phase 2: Decentralization
 - [ ] DHT-based peer discovery

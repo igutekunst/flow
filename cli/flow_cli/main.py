@@ -8,6 +8,8 @@ import base64
 import asyncio
 import websockets
 import urllib.parse
+import hashlib
+import hmac
 from pathlib import Path
 from datetime import datetime
 
@@ -39,48 +41,31 @@ def save_token(token):
     TOKEN_FILE.write_text(token)
     TOKEN_FILE.chmod(0o600)  # Secure permissions
 
-def parse_prefix(prefix_input: str, format_type: str = 'utf8') -> str:
-    """
-    Parse prefix input and convert to hex string (up to 8 bytes).
-    Used for agent/event creation (no padding).
-    """
-    if format_type == 'utf8':
-        # Convert UTF-8 string to bytes
-        prefix_bytes = prefix_input.encode('utf-8')
-    elif format_type == 'hex':
-        # Parse hex string to bytes
-        try:
-            # Remove any spaces or common separators
-            clean_hex = prefix_input.replace(' ', '').replace('-', '').replace(':', '')
-            prefix_bytes = bytes.fromhex(clean_hex)
-        except ValueError:
-            raise click.ClickException(f"Invalid hex format: {prefix_input}")
-    elif format_type == 'base64':
-        # Parse base64 string to bytes
-        try:
-            prefix_bytes = base64.b64decode(prefix_input)
-        except Exception:
-            raise click.ClickException(f"Invalid base64 format: {prefix_input}")
-    else:
-        raise click.ClickException(f"Unknown format: {format_type}")
-    
-    if len(prefix_bytes) > 8:
-        raise click.ClickException(f"Prefix too long: {len(prefix_bytes)} bytes (max 8 bytes)")
-    
-    # Convert to hex string (no padding for agent/event creation)
-    return prefix_bytes.hex()
+def generate_topic_hash(topic_path: str) -> str:
+    """Generate 32-bit hash of topic path"""
+    return hashlib.sha256(topic_path.encode('utf-8')).digest()[:4].hex()
 
-def add_event_with_prefix(message: str, prefix: str = None, format_type: str = 'utf8'):
-    """Add an event, optionally with a prefix override."""
+def generate_topic_nonce(topic_key_hex: str, topic_path: str) -> str:
+    """Generate deterministic 32-bit nonce for topic using HMAC"""
+    topic_key = bytes.fromhex(topic_key_hex)
+    return hmac.new(topic_key, topic_path.encode('utf-8'), hashlib.sha256).digest()[:4].hex()
+
+def compute_topic_prefix(org_id: str, topic_path: str, topic_key: str) -> str:
+    """Compute the full topic prefix for watching/sharing"""
+    topic_hash = generate_topic_hash(topic_path)
+    topic_nonce = generate_topic_nonce(topic_key, topic_path)
+    return f"{org_id}{topic_hash}{topic_nonce}"
+
+def add_event_with_topic(message: str, topic_path: str = None):
+    """Add an event, optionally with a topic path."""
     try:
         data = {"body": message}
-        if prefix:
-            prefix_hex = parse_prefix(prefix, format_type)
-            data["prefix_override"] = prefix_hex
+        if topic_path:
+            data["topic_path"] = topic_path
             
         result = make_request("POST", "/events", data)
-        prefix_info = f" (prefix: {prefix})" if prefix else ""
-        click.echo(f"✓ Event added{prefix_info}: {result['id']}")
+        topic_info = f" (topic: {topic_path})" if topic_path else ""
+        click.echo(f"✓ Event added{topic_info}: {result['id']}")
     except Exception as e:
         click.echo(f"❌ Error: {e}", err=True)
         sys.exit(1)
@@ -113,11 +98,9 @@ def make_request(method, endpoint, data=None, params=None):
 
 @click.group(invoke_without_command=True)
 @click.pass_context
-@click.option('-p', '--prefix', help='Prefix for event (UTF-8 by default)')
-@click.option('--hex', 'prefix_format', flag_value='hex', help='Interpret prefix as hex')
-@click.option('--base64', 'prefix_format', flag_value='base64', help='Interpret prefix as base64')
-def cli(ctx, prefix, prefix_format):
-    """SuperCortex Flow CLI - Event ingestion system"""
+@click.option('-t', '--topic', help='Topic path for event (e.g., logs.errors)')
+def cli(ctx, topic):
+    """SuperCortex Flow CLI - Event ingestion system with 256-bit addressing"""
     # If no subcommand is provided, check for stdin input
     if ctx.invoked_subcommand is None:
         # Check if there's stdin data available
@@ -125,8 +108,7 @@ def cli(ctx, prefix, prefix_format):
             # Read from stdin
             stdin_content = sys.stdin.read().strip()
             if stdin_content:
-                format_type = prefix_format or 'utf8'
-                add_event_with_prefix(stdin_content, prefix, format_type)
+                add_event_with_topic(stdin_content, topic)
             else:
                 click.echo("❌ No input provided", err=True)
                 sys.exit(1)
@@ -151,21 +133,85 @@ def login():
     )
     
     # Save both config and token
-    config = {"base_url": server_url}
+    config = load_config()
+    config["base_url"] = server_url
     save_config(config)
     save_token(token)
     
     click.echo(f"✓ Logged in successfully to {server_url}")
 
+@cli.group()
+def config():
+    """Configuration management"""
+    pass
+
+@config.command("create-org")
+@click.option('--alias', help='Human-readable alias for the organization (local only)')
+def create_org(alias):
+    """Create a new organization with random 64-bit ID"""
+    try:
+        result = make_request("POST", "/agents", {})
+        
+        # Save org info in config
+        config_data = load_config()
+        config_data["default_org_id"] = result["id"]
+        config_data["default_topic_key"] = result["topic_key"]
+        
+        if alias:
+            if "org_aliases" not in config_data:
+                config_data["org_aliases"] = {}
+            config_data["org_aliases"][alias] = result["id"]
+            
+        save_config(config_data)
+        
+        alias_info = f" (alias: {alias})" if alias else ""
+        click.echo(f"✓ Created organization: {result['id']}{alias_info}")
+        click.echo(f"✓ Set as default organization")
+        click.echo(f"  Token: {result['token']}")
+        click.echo(f"  Topic Key: {result['topic_key']}")
+        
+    except Exception as e:
+        click.echo(f"❌ Error: {e}", err=True)
+        sys.exit(1)
+
+@config.command("show")
+def show_config():
+    """Show current configuration"""
+    config_data = load_config()
+    click.echo("Current configuration:")
+    click.echo(f"  Server: {config_data.get('base_url', 'Not set')}")
+    click.echo(f"  Default Org: {config_data.get('default_org_id', 'Not set')}")
+    
+    aliases = config_data.get('org_aliases', {})
+    if aliases:
+        click.echo("  Org Aliases:")
+        for alias, org_id in aliases.items():
+            click.echo(f"    {alias}: {org_id}")
+
+@config.command("set-org")  
+@click.argument('org_alias')
+def set_org(org_alias):
+    """Set default organization by alias"""
+    config_data = load_config()
+    aliases = config_data.get('org_aliases', {})
+    
+    if org_alias not in aliases:
+        click.echo(f"❌ Unknown org alias: {org_alias}", err=True)
+        click.echo("Available aliases:", err=True)
+        for alias in aliases.keys():
+            click.echo(f"  {alias}", err=True)
+        sys.exit(1)
+    
+    config_data["default_org_id"] = aliases[org_alias]
+    save_config(config_data)
+    click.echo(f"✓ Set default organization to: {org_alias} ({aliases[org_alias]})")
+
 @cli.command()
 @click.argument('message')
-@click.option('-p', '--prefix', help='Prefix for event (UTF-8 by default)')
-@click.option('--hex', 'prefix_format', flag_value='hex', help='Interpret prefix as hex')
-@click.option('--base64', 'prefix_format', flag_value='base64', help='Interpret prefix as base64')
-def add(message, prefix, prefix_format):
+@click.option('-t', '--topic', help='Topic path for event (e.g., logs.errors)')
+def add(message, topic):
     """Add an event to the stream"""
-    format_type = prefix_format or 'utf8'
-    add_event_with_prefix(message, prefix, format_type)
+    add_event_with_topic(message, topic)
 
 @cli.command()
 @click.argument('event_id')
@@ -199,36 +245,54 @@ def get(event_id):
 
 @cli.command("agent")
 @click.argument('subcommand')
-@click.option('--prefix', help='Prefix for agent (UTF-8 by default)')
-@click.option('--hex', 'prefix_format', flag_value='hex', help='Interpret prefix as hex')
-@click.option('--base64', 'prefix_format', flag_value='base64', help='Interpret prefix as base64')
-def agent_cmd(subcommand, prefix, prefix_format):
+def agent_cmd(subcommand):
     """Agent management"""
     if subcommand == "create":
         try:
-            data = {}
-            if prefix:
-                format_type = prefix_format or 'utf8'
-                try:
-                    prefix_hex = parse_prefix(prefix, format_type)
-                    data["prefix"] = prefix_hex
-                except click.ClickException as e:
-                    click.echo(f"❌ {e}", err=True)
-                    sys.exit(1)
-            
-            result = make_request("POST", "/agents", data)
+            result = make_request("POST", "/agents", {})
             click.echo(f"✓ Agent created:")
             click.echo(f"  ID: {result['id']}")
             click.echo(f"  Token: {result['token']}")
-            if result.get('prefix'):
-                click.echo(f"  Prefix: {result['prefix']}")
+            click.echo(f"  Topic Key: {result['topic_key']}")
         except Exception as e:
             click.echo(f"❌ Error: {e}", err=True)
             sys.exit(1)
     else:
         click.echo(f"❌ Unknown agent subcommand: {subcommand}", err=True)
 
-async def watch_with_websocket(prefix: str, format_type: str):
+@cli.command("share-topic")
+@click.argument('topic_path')
+@click.option('--copy', is_flag=True, help='Copy to clipboard (if available)')
+def share_topic(topic_path, copy):
+    """Generate shareable prefix for a specific topic"""
+    config_data = load_config()
+    org_id = config_data.get('default_org_id')
+    topic_key = config_data.get('default_topic_key')
+    
+    if not org_id or not topic_key:
+        click.echo("❌ No default organization set. Run 'flow config create-org' first", err=True)
+        sys.exit(1)
+    
+    try:
+        # Compute the shareable prefix
+        prefix = compute_topic_prefix(org_id, topic_path, topic_key)
+        
+        click.echo(f"✓ Shareable prefix for '{topic_path}':")
+        click.echo(f"  {prefix}")
+        
+        if copy:
+            try:
+                import pyperclip
+                pyperclip.copy(prefix)
+                click.echo("✓ Copied to clipboard")
+            except ImportError:
+                click.echo("❌ Clipboard functionality not available (install pyperclip)")
+                
+    except Exception as e:
+        click.echo(f"❌ Error: {e}", err=True)
+        sys.exit(1)
+
+async def watch_with_websocket(prefix_or_topic: str):
     """Watch for events using WebSocket connection for real-time updates"""
     config = load_config()
     token = load_token()
@@ -237,18 +301,36 @@ async def watch_with_websocket(prefix: str, format_type: str):
         click.echo("❌ Not logged in. Use 'flow login' first", err=True)
         sys.exit(1)
     
+    # Determine if this is a topic path or raw hex prefix
+    if all(c in '0123456789abcdefABCDEF' for c in prefix_or_topic) and len(prefix_or_topic) >= 16:
+        # Raw hex prefix
+        prefix = prefix_or_topic.lower()
+        display_name = f"prefix {prefix}"
+    else:
+        # Topic path - compute prefix
+        config_data = load_config()
+        org_id = config_data.get('default_org_id')
+        topic_key = config_data.get('default_topic_key')
+        
+        if not org_id or not topic_key:
+            click.echo("❌ No default organization set. For raw hex prefixes, use full prefix.", err=True)
+            click.echo("❌ For topic paths, run 'flow config create-org' first", err=True)
+            sys.exit(1)
+        
+        prefix = compute_topic_prefix(org_id, prefix_or_topic, topic_key)
+        display_name = f"topic '{prefix_or_topic}'"
+    
     # Convert HTTP URL to WebSocket URL
     ws_url = config['base_url'].replace('http://', 'ws://').replace('https://', 'wss://')
     
     # Build WebSocket URL with query parameters
     query_params = urllib.parse.urlencode({
         'prefix': prefix,
-        'prefix_format': format_type,
         'token': token
     })
     full_ws_url = f"{ws_url}/events/watch_ws?{query_params}"
     
-    click.echo(f"👀 Watching for events with prefix: '{prefix}' ({format_type} format)")
+    click.echo(f"👀 Watching for events on {display_name}")
     click.echo("   Connecting via WebSocket for real-time updates... (Ctrl+C to stop)")
     
     try:
@@ -258,7 +340,7 @@ async def watch_with_websocket(prefix: str, format_type: str):
                     data = json.loads(message)
                     
                     if data.get("type") == "connected":
-                        click.echo(f"   Connected! Padded prefix: {data['prefix_used']}")
+                        click.echo(f"   Connected! Using prefix: {data['prefix_used']}")
                         continue
                     
                     # This is an event
@@ -282,40 +364,53 @@ async def watch_with_websocket(prefix: str, format_type: str):
         click.echo(f"❌ WebSocket error: {e}", err=True)
 
 @cli.command()
-@click.argument('prefix', required=True)
-@click.option('--hex', 'format_type', flag_value='hex', help='Interpret prefix as hex')
-@click.option('--base64', 'format_type', flag_value='base64', help='Interpret prefix as base64')
+@click.argument('prefix_or_topic', required=True)
 @click.option('--poll', is_flag=True, help='Use polling instead of WebSocket (fallback mode)')
-def watch(prefix, format_type, poll):
-    """Watch for new events with specific prefix (real-time via WebSocket)"""
-    
-    # Default to UTF-8 if no format specified
-    if format_type is None:
-        format_type = 'utf8'
+def watch(prefix_or_topic, poll):
+    """Watch for new events (topic path or hex prefix)"""
     
     if poll:
         # Use the old polling method as fallback
-        watch_with_polling(prefix, format_type)
+        watch_with_polling(prefix_or_topic)
     else:
         # Use WebSocket for real-time updates
         try:
-            asyncio.run(watch_with_websocket(prefix, format_type))
+            asyncio.run(watch_with_websocket(prefix_or_topic))
         except KeyboardInterrupt:
             click.echo("\n👋 Stopped watching")
 
-def watch_with_polling(prefix: str, format_type: str):
+def watch_with_polling(prefix_or_topic: str):
     """Original polling implementation (kept as fallback)"""
-    click.echo(f"👀 Watching for events with prefix: '{prefix}' ({format_type} format)")
-    click.echo("   Server will pad to 64-bits. Using polling mode. (Ctrl+C to stop)")
+    config = load_config()
+    
+    # Determine if this is a topic path or raw hex prefix
+    if all(c in '0123456789abcdefABCDEF' for c in prefix_or_topic) and len(prefix_or_topic) >= 16:
+        # Raw hex prefix
+        prefix = prefix_or_topic.lower()
+        display_name = f"prefix {prefix}"
+    else:
+        # Topic path - compute prefix
+        config_data = load_config()
+        org_id = config_data.get('default_org_id')
+        topic_key = config_data.get('default_topic_key')
+        
+        if not org_id or not topic_key:
+            click.echo("❌ No default organization set. For raw hex prefixes, use full prefix.", err=True)
+            click.echo("❌ For topic paths, run 'flow config create-org' first", err=True)
+            sys.exit(1)
+        
+        prefix = compute_topic_prefix(org_id, prefix_or_topic, topic_key)
+        display_name = f"topic '{prefix_or_topic}'"
+    
+    click.echo(f"👀 Watching for events on {display_name} (polling mode)")
+    click.echo("   (Ctrl+C to stop)")
     
     last_timestamp = None
     try:
         while True:
             try:
-                # Use server-side filtering endpoint
                 params = {
                     'prefix': prefix,
-                    'prefix_format': format_type,
                     'limit': 100
                 }
                 if last_timestamp:
@@ -323,9 +418,9 @@ def watch_with_polling(prefix: str, format_type: str):
                 
                 result = make_request("GET", "/events/watch", params=params)
                 
-                # Show the padded prefix from server on first run
+                # Show the prefix from server on first run
                 if last_timestamp is None:
-                    click.echo(f"   Padded prefix: {result['prefix_used']}")
+                    click.echo(f"   Using prefix: {result['prefix_used']}")
                 
                 events = result['events']
                 
@@ -358,7 +453,7 @@ def watch_with_polling(prefix: str, format_type: str):
     except KeyboardInterrupt:
         click.echo("\n👋 Stopped watching")
 
-async def nc_listen_websocket(prefix: str, format_type: str):
+async def nc_listen_websocket(prefix_or_topic: str):
     """Netcat-style listen mode using WebSocket - streams raw event bodies to stdout"""
     config = load_config()
     token = load_token()
@@ -367,13 +462,28 @@ async def nc_listen_websocket(prefix: str, format_type: str):
         click.echo("❌ Not logged in. Use 'flow login' first", err=True)
         sys.exit(1)
     
+    # Determine if this is a topic path or raw hex prefix
+    if all(c in '0123456789abcdefABCDEF' for c in prefix_or_topic) and len(prefix_or_topic) >= 16:
+        # Raw hex prefix
+        prefix = prefix_or_topic.lower()
+    else:
+        # Topic path - compute prefix
+        config_data = load_config()
+        org_id = config_data.get('default_org_id')
+        topic_key = config_data.get('default_topic_key')
+        
+        if not org_id or not topic_key:
+            click.echo("# Error: No default organization set", err=True)
+            sys.exit(1)
+        
+        prefix = compute_topic_prefix(org_id, prefix_or_topic, topic_key)
+    
     # Convert HTTP URL to WebSocket URL
     ws_url = config['base_url'].replace('http://', 'ws://').replace('https://', 'wss://')
     
     # Build WebSocket URL with query parameters
     query_params = urllib.parse.urlencode({
         'prefix': prefix,
-        'prefix_format': format_type,
         'token': token
     })
     full_ws_url = f"{ws_url}/events/watch_ws?{query_params}"
@@ -428,21 +538,15 @@ async def nc_listen_websocket(prefix: str, format_type: str):
         click.echo(f"# WebSocket error: {e}", err=True)
 
 @cli.command()
-@click.argument('prefix', required=True)
+@click.argument('prefix_or_topic', required=True)
 @click.option('-l', '--listen', is_flag=True, help='Listen mode - stream event bodies to stdout (netcat-style)')
-@click.option('--hex', 'format_type', flag_value='hex', help='Interpret prefix as hex')
-@click.option('--base64', 'format_type', flag_value='base64', help='Interpret prefix as base64')
-def nc(prefix, listen, format_type):
+def nc(prefix_or_topic, listen):
     """Netcat-style event streaming - raw bodies for scripting/piping"""
-    
-    # Default to UTF-8 if no format specified
-    if format_type is None:
-        format_type = 'utf8'
     
     if listen:
         # Listen mode - stream events to stdout
         try:
-            asyncio.run(nc_listen_websocket(prefix, format_type))
+            asyncio.run(nc_listen_websocket(prefix_or_topic))
         except KeyboardInterrupt:
             click.echo("\n# Stopped listening", err=True)
     else:
@@ -450,12 +554,20 @@ def nc(prefix, listen, format_type):
         click.echo("# Send mode: Reading from stdin...", err=True)
         click.echo("# (Ctrl+C to stop, Ctrl+D to end input)", err=True)
         
+        # Determine topic from argument
+        if all(c in '0123456789abcdefABCDEF' for c in prefix_or_topic) and len(prefix_or_topic) >= 16:
+            # Raw hex prefix - can't send to specific prefix, would need topic
+            click.echo("# Error: Cannot send to raw hex prefix. Use topic path instead.", err=True)
+            sys.exit(1)
+        
+        topic_path = prefix_or_topic
+        
         try:
             for line in sys.stdin:
                 line = line.rstrip('\n\r')
                 if line:  # Skip empty lines
                     try:
-                        add_event_with_prefix(line, prefix, format_type)
+                        add_event_with_topic(line, topic_path)
                     except Exception as e:
                         click.echo(f"# Error sending event: {e}", err=True)
         except KeyboardInterrupt:
