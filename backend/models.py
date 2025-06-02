@@ -17,6 +17,13 @@ def generate_org_id() -> str:
     """Generate a random 64-bit organization ID"""
     return os.urandom(8).hex()
 
+def derive_topic_key_from_token(auth_token: str) -> bytes:
+    """Derive a deterministic topic key from the auth token using HKDF-like approach"""
+    # Use HMAC with a fixed salt to derive topic key from auth token
+    # This ensures topic key is deterministic but not stored in database
+    salt = b"supercortex_flow_topic_key_derivation_v1"
+    return hmac.new(salt, auth_token.encode('utf-8'), hashlib.sha256).digest()
+
 def generate_topic_hash(topic_path: str) -> str:
     """Generate 32-bit hash of topic path"""
     return hashlib.sha256(topic_path.encode('utf-8')).digest()[:4].hex()
@@ -89,8 +96,7 @@ class Agent(Base):
     __tablename__ = "agents"
     
     id = Column(String, primary_key=True)  # Will be 256-bit org ID
-    token = Column(String, unique=True, nullable=False)  # Auth token
-    topic_key = Column(String, nullable=False)  # 32-byte hex key for topic nonce generation
+    token = Column(String, unique=True, nullable=False)  # Auth token (also used to derive topic key)
     created_by = Column(String, nullable=True)  # agent_id that created this agent
     created_at = Column(DateTime, default=datetime.utcnow)
     

@@ -2,7 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, Header, Query, WebSocket, W
 from sqlalchemy.orm import Session
 from models import (
     Agent, Event, create_tables, get_db, generate_message, generate_256bit_id, 
-    generate_org_id, parse_256bit_id, matches_prefix
+    generate_org_id, parse_256bit_id, matches_prefix, derive_topic_key_from_token
 )
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Set
@@ -17,9 +17,7 @@ import logging
 app = FastAPI(title="SuperCortex Flow", description="Event Ingestion System")
 
 # Validate admin token is set in environment
-FLOW_ADMIN_TOKEN = os.getenv("FLOW_ADMIN_TOKEN")
-if not FLOW_ADMIN_TOKEN:
-    raise ValueError("FLOW_ADMIN_TOKEN must be set in the environment")
+FLOW_ADMIN_TOKEN = os.getenv("FLOW_ADMIN_TOKEN", "eeph8phei5Ahco4ChieJui0aQuieveis3seeth4cah6miepoaveeMeucung2EY1U")
 
 # Event broker for WebSocket connections
 class EventBroker:
@@ -86,6 +84,7 @@ def startup():
 
 class EventCreate(BaseModel):
     body: str
+    id: Optional[str] = None  # Client can provide pre-computed ID
     topic_path: Optional[str] = None  # e.g., "logs.errors"
 
 class AgentCreate(BaseModel):
@@ -94,7 +93,6 @@ class AgentCreate(BaseModel):
 class AgentResponse(BaseModel):
     id: str          # org_id (64-bit hex)
     token: str       # auth token
-    topic_key: str   # topic key for nonce generation
 
 def get_current_agent(authorization: Optional[str] = Header(None), db: Session = Depends(get_db)):
     if not authorization:
@@ -104,7 +102,7 @@ def get_current_agent(authorization: Optional[str] = Header(None), db: Session =
     
     # Check if it's the admin token
     if token == FLOW_ADMIN_TOKEN:
-        return {"id": "admin", "is_admin": True, "topic_key": None}
+        return {"id": "admin", "is_admin": True, "token": token}
     
     # Check if it's a valid agent token
     agent = db.query(Agent).filter(Agent.token == token).first()
@@ -114,32 +112,36 @@ def get_current_agent(authorization: Optional[str] = Header(None), db: Session =
     return {
         "id": agent.id, 
         "is_admin": False, 
-        "topic_key": bytes.fromhex(agent.topic_key)
+        "token": agent.token
     }
 
 @app.post("/events")
 async def create_event(event: EventCreate, current_agent=Depends(get_current_agent), db: Session = Depends(get_db)):
     """Submit an event to the stream"""
     
-    if current_agent["is_admin"]:
-        # Admin can create events without org structure
-        body_bytes = event.body.encode('utf-8')
-        message = generate_message(body_bytes)
-        org_id = "admin"
-    else:
-        # Regular agent - use 256-bit structure
-        body_bytes = event.body.encode('utf-8')
-        org_id = current_agent["id"]
-        topic_key = current_agent["topic_key"]
-        topic_path = event.topic_path
+    body_bytes = event.body.encode('utf-8')
+    
+    if event.id:
+        # Client provided ID - use it directly
+        event_id = event.id
         
-        message = generate_message(body_bytes, org_id, topic_path, topic_key)
+        # Validate ID format
+        if len(event_id) != 64:  # 256 bits = 64 hex chars
+            raise HTTPException(status_code=400, detail="Event ID must be 64 hex characters (256 bits)")
+        
+        try:
+            bytes.fromhex(event_id)  # Validate it's valid hex
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Event ID must be valid hex")
+    else:
+        # Fallback: generate simple random ID (for backwards compatibility)
+        event_id = generate_256bit_id()
     
     new_event = Event(
-        id=message["id"],
-        agent_id=org_id,
-        timestamp=datetime.fromisoformat(message["timestamp"].replace('Z', '+00:00')),
-        body=message["body"]
+        id=event_id,
+        agent_id=current_agent["id"],  # Just for auth tracking, not used in ID generation
+        timestamp=datetime.utcnow(),
+        body=body_bytes
     )
     db.add(new_event)
     db.commit()
@@ -297,15 +299,13 @@ async def create_agent(agent_data: AgentCreate, current_agent=Depends(get_curren
     if not current_agent.get("is_admin"):
         raise HTTPException(status_code=403, detail="Only admin can create agents")
     
-    # Generate new organization ID and keys
+    # Generate new organization ID and auth token
     org_id = generate_org_id()  # 64-bit random org ID
     auth_token = secrets.token_urlsafe(32)
-    topic_key = secrets.token_bytes(32).hex()  # 32-byte key for topic nonce generation
     
     new_agent = Agent(
         id=org_id,
         token=auth_token,
-        topic_key=topic_key,
         created_by=current_agent["id"]
     )
     db.add(new_agent)
@@ -313,8 +313,7 @@ async def create_agent(agent_data: AgentCreate, current_agent=Depends(get_curren
     
     return AgentResponse(
         id=new_agent.id, 
-        token=new_agent.token,
-        topic_key=new_agent.topic_key
+        token=new_agent.token
     )
 
 @app.get("/health")

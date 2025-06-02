@@ -41,25 +41,88 @@ def save_token(token):
     TOKEN_FILE.write_text(token)
     TOKEN_FILE.chmod(0o600)  # Secure permissions
 
+def derive_topic_key_from_token(auth_token: str) -> bytes:
+    """Derive a deterministic topic key from the auth token (client-side)"""
+    # Same derivation as server - ensures consistency
+    salt = b"supercortex_flow_topic_key_derivation_v1"
+    return hmac.new(salt, auth_token.encode('utf-8'), hashlib.sha256).digest()
+
 def generate_topic_hash(topic_path: str) -> str:
     """Generate 32-bit hash of topic path"""
     return hashlib.sha256(topic_path.encode('utf-8')).digest()[:4].hex()
 
-def generate_topic_nonce(topic_key_hex: str, topic_path: str) -> str:
+def generate_topic_nonce(topic_key: bytes, topic_path: str) -> str:
     """Generate deterministic 32-bit nonce for topic using HMAC"""
-    topic_key = bytes.fromhex(topic_key_hex)
     return hmac.new(topic_key, topic_path.encode('utf-8'), hashlib.sha256).digest()[:4].hex()
 
-def compute_topic_prefix(org_id: str, topic_path: str, topic_key: str) -> str:
+def compute_topic_prefix(org_id: str, topic_path: str, auth_token: str) -> str:
     """Compute the full topic prefix for watching/sharing"""
+    topic_key = derive_topic_key_from_token(auth_token)
     topic_hash = generate_topic_hash(topic_path)
     topic_nonce = generate_topic_nonce(topic_key, topic_path)
     return f"{org_id}{topic_hash}{topic_nonce}"
 
+def generate_256bit_id(org_id: str = None, topic_path: str = None, topic_key: bytes = None) -> str:
+    """
+    Generate a 256-bit ID with structure:
+    64-bit org_id + 32-bit topic_hash + 32-bit topic_nonce + 128-bit random
+    
+    Same logic as backend but client-controlled
+    """
+    import os
+    import hashlib
+    import hmac
+    
+    # 64-bit org ID (8 bytes)
+    if org_id:
+        org_bytes = bytes.fromhex(org_id)
+        if len(org_bytes) != 8:
+            raise ValueError("org_id must be exactly 64 bits (8 bytes)")
+    else:
+        org_bytes = os.urandom(8)
+    
+    # 32-bit topic hash (4 bytes)
+    if topic_path:
+        topic_hash_bytes = hashlib.sha256(topic_path.encode('utf-8')).digest()[:4]
+    else:
+        topic_hash_bytes = b'\x00' * 4
+    
+    # 32-bit topic nonce (4 bytes)  
+    if topic_path and topic_key:
+        topic_nonce_bytes = hmac.new(topic_key, topic_path.encode('utf-8'), hashlib.sha256).digest()[:4]
+    else:
+        topic_nonce_bytes = b'\x00' * 4
+        
+    # 128-bit random (16 bytes)
+    random_bytes = os.urandom(16)
+    
+    # Combine all parts (32 bytes total = 256 bits)
+    full_id = org_bytes + topic_hash_bytes + topic_nonce_bytes + random_bytes
+    return full_id.hex()
+
 def add_event_with_topic(message: str, topic_path: str = None):
     """Add an event, optionally with a topic path."""
     try:
-        data = {"body": message}
+        config_data = load_config()
+        org_id = config_data.get('default_org_id')
+        auth_token = load_token()
+        
+        if org_id and auth_token:
+            # Generate ID client-side using config org_id
+            if topic_path:
+                topic_key = derive_topic_key_from_token(auth_token)
+                event_id = generate_256bit_id(org_id, topic_path, topic_key)
+            else:
+                event_id = generate_256bit_id(org_id)
+            
+            data = {
+                "body": message,
+                "id": event_id  # Send pre-computed ID
+            }
+        else:
+            # Fallback for backwards compatibility
+            data = {"body": message}
+            
         if topic_path:
             data["topic_path"] = topic_path
             
@@ -155,7 +218,6 @@ def create_org(alias):
         # Save org info in config
         config_data = load_config()
         config_data["default_org_id"] = result["id"]
-        config_data["default_topic_key"] = result["topic_key"]
         
         if alias:
             if "org_aliases" not in config_data:
@@ -168,7 +230,7 @@ def create_org(alias):
         click.echo(f"✓ Created organization: {result['id']}{alias_info}")
         click.echo(f"✓ Set as default organization")
         click.echo(f"  Token: {result['token']}")
-        click.echo(f"  Topic Key: {result['topic_key']}")
+        click.echo(f"  Topic keys will be derived from token (not stored)")
         
     except Exception as e:
         click.echo(f"❌ Error: {e}", err=True)
@@ -253,7 +315,7 @@ def agent_cmd(subcommand):
             click.echo(f"✓ Agent created:")
             click.echo(f"  ID: {result['id']}")
             click.echo(f"  Token: {result['token']}")
-            click.echo(f"  Topic Key: {result['topic_key']}")
+            click.echo(f"  Topic keys will be derived from token")
         except Exception as e:
             click.echo(f"❌ Error: {e}", err=True)
             sys.exit(1)
@@ -267,15 +329,15 @@ def share_topic(topic_path, copy):
     """Generate shareable prefix for a specific topic"""
     config_data = load_config()
     org_id = config_data.get('default_org_id')
-    topic_key = config_data.get('default_topic_key')
+    auth_token = load_token()
     
-    if not org_id or not topic_key:
+    if not org_id or not auth_token:
         click.echo("❌ No default organization set. Run 'flow config create-org' first", err=True)
         sys.exit(1)
     
     try:
-        # Compute the shareable prefix
-        prefix = compute_topic_prefix(org_id, topic_path, topic_key)
+        # Compute the shareable prefix using derived topic key
+        prefix = compute_topic_prefix(org_id, topic_path, auth_token)
         
         click.echo(f"✓ Shareable prefix for '{topic_path}':")
         click.echo(f"  {prefix}")
@@ -310,14 +372,13 @@ async def watch_with_websocket(prefix_or_topic: str):
         # Topic path - compute prefix
         config_data = load_config()
         org_id = config_data.get('default_org_id')
-        topic_key = config_data.get('default_topic_key')
         
-        if not org_id or not topic_key:
+        if not org_id:
             click.echo("❌ No default organization set. For raw hex prefixes, use full prefix.", err=True)
             click.echo("❌ For topic paths, run 'flow config create-org' first", err=True)
             sys.exit(1)
         
-        prefix = compute_topic_prefix(org_id, prefix_or_topic, topic_key)
+        prefix = compute_topic_prefix(org_id, prefix_or_topic, token)
         display_name = f"topic '{prefix_or_topic}'"
     
     # Convert HTTP URL to WebSocket URL
@@ -382,6 +443,7 @@ def watch(prefix_or_topic, poll):
 def watch_with_polling(prefix_or_topic: str):
     """Original polling implementation (kept as fallback)"""
     config = load_config()
+    token = load_token()
     
     # Determine if this is a topic path or raw hex prefix
     if all(c in '0123456789abcdefABCDEF' for c in prefix_or_topic) and len(prefix_or_topic) >= 16:
@@ -392,14 +454,13 @@ def watch_with_polling(prefix_or_topic: str):
         # Topic path - compute prefix
         config_data = load_config()
         org_id = config_data.get('default_org_id')
-        topic_key = config_data.get('default_topic_key')
         
-        if not org_id or not topic_key:
+        if not org_id:
             click.echo("❌ No default organization set. For raw hex prefixes, use full prefix.", err=True)
             click.echo("❌ For topic paths, run 'flow config create-org' first", err=True)
             sys.exit(1)
         
-        prefix = compute_topic_prefix(org_id, prefix_or_topic, topic_key)
+        prefix = compute_topic_prefix(org_id, prefix_or_topic, token)
         display_name = f"topic '{prefix_or_topic}'"
     
     click.echo(f"👀 Watching for events on {display_name} (polling mode)")
@@ -470,13 +531,12 @@ async def nc_listen_websocket(prefix_or_topic: str):
         # Topic path - compute prefix
         config_data = load_config()
         org_id = config_data.get('default_org_id')
-        topic_key = config_data.get('default_topic_key')
         
-        if not org_id or not topic_key:
+        if not org_id:
             click.echo("# Error: No default organization set", err=True)
             sys.exit(1)
         
-        prefix = compute_topic_prefix(org_id, prefix_or_topic, topic_key)
+        prefix = compute_topic_prefix(org_id, prefix_or_topic, token)
     
     # Convert HTTP URL to WebSocket URL
     ws_url = config['base_url'].replace('http://', 'ws://').replace('https://', 'wss://')
