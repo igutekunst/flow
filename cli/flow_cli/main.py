@@ -77,6 +77,46 @@ def compute_topic_prefix(org_id: str, topic_path: str, client_secret: str) -> st
     topic_nonce = generate_topic_nonce(topic_key, topic_path)
     return f"{org_id}{topic_hash}{topic_nonce}"
 
+def resolve_prefix_or_topic(prefix_or_topic: str) -> tuple[str, str]:
+    """
+    Resolve a prefix_or_topic string to (actual_hex_prefix, display_name)
+    Handles:
+    1. Prefix aliases (saved hex prefixes with friendly names)
+    2. Raw hex prefixes 
+    3. Topic paths (computed from org_id + client_secret)
+    
+    Returns: (hex_prefix, display_name)
+    """
+    config_data = load_config()
+    
+    # Check if it's a prefix alias first
+    prefix_aliases = config_data.get("prefix_aliases", {})
+    if prefix_or_topic in prefix_aliases:
+        hex_prefix = prefix_aliases[prefix_or_topic]
+        return hex_prefix, f"alias '{prefix_or_topic}' ({hex_prefix})"
+    
+    # Check if it's a raw hex prefix
+    if all(c in '0123456789abcdefABCDEF' for c in prefix_or_topic) and len(prefix_or_topic) >= 16:
+        hex_prefix = prefix_or_topic.lower()
+        return hex_prefix, f"prefix {hex_prefix}"
+    
+    # Must be a topic path - compute prefix
+    org_id = config_data.get('default_org_id')
+    client_secret = load_client_secret()
+    
+    if not org_id:
+        click.echo("❌ No default organization set. For raw hex prefixes, use full prefix.", err=True)
+        click.echo("❌ For topic paths, run 'flow config create-org' first", err=True)
+        click.echo("❌ For saved prefixes, use 'flow config add-prefix-alias' first", err=True)
+        sys.exit(1)
+    
+    if not client_secret:
+        click.echo("❌ No client secret found. Run 'flow config generate-secret' first", err=True)
+        sys.exit(1)
+    
+    hex_prefix = compute_topic_prefix(org_id, prefix_or_topic, client_secret)
+    return hex_prefix, f"topic '{prefix_or_topic}'"
+
 def generate_256bit_id(org_id: str = None, topic_path: str = None, topic_key: bytes = None) -> str:
     """
     Generate a 256-bit ID with structure:
@@ -279,6 +319,12 @@ def show_config():
         click.echo("  Org Aliases:")
         for alias, org_id in aliases.items():
             click.echo(f"    {alias}: {org_id}")
+    
+    prefix_aliases = config_data.get('prefix_aliases', {})
+    if prefix_aliases:
+        click.echo("  Prefix Aliases:")
+        for alias, hex_prefix in prefix_aliases.items():
+            click.echo(f"    {alias}: {hex_prefix}")
 
 @config.command("show-token")
 def show_token():
@@ -402,6 +448,87 @@ def import_secret(file, force):
     except FileNotFoundError:
         click.echo(f"❌ File not found: {file}", err=True)
         sys.exit(1)
+
+@config.command("add-prefix-alias")
+@click.argument('alias_name')
+@click.argument('hex_prefix')
+def add_prefix_alias(alias_name, hex_prefix):
+    """Add an alias for a hex prefix (e.g., from sharing)"""
+    
+    # Validate hex prefix
+    if not all(c in '0123456789abcdefABCDEF' for c in hex_prefix):
+        click.echo("❌ Prefix must be valid hexadecimal", err=True)
+        sys.exit(1)
+    
+    if len(hex_prefix) < 16:
+        click.echo("❌ Prefix must be at least 16 hex characters (64 bits)", err=True)
+        sys.exit(1)
+    
+    # Normalize to lowercase
+    hex_prefix = hex_prefix.lower()
+    
+    config_data = load_config()
+    if "prefix_aliases" not in config_data:
+        config_data["prefix_aliases"] = {}
+    
+    # Check if alias already exists
+    if alias_name in config_data["prefix_aliases"]:
+        old_prefix = config_data["prefix_aliases"][alias_name]
+        if not click.confirm(f"⚠️  Alias '{alias_name}' already exists (points to {old_prefix}). Overwrite?"):
+            click.echo("❌ Cancelled")
+            return
+    
+    config_data["prefix_aliases"][alias_name] = hex_prefix
+    save_config(config_data)
+    
+    click.echo(f"✓ Added prefix alias:")
+    click.echo(f"  {alias_name} -> {hex_prefix}")
+    click.echo(f"💡 You can now use: flow watch {alias_name}")
+
+@config.command("list-prefix-aliases")
+def list_prefix_aliases():
+    """List all saved prefix aliases"""
+    config_data = load_config()
+    aliases = config_data.get("prefix_aliases", {})
+    
+    if not aliases:
+        click.echo("📭 No prefix aliases found")
+        click.echo("💡 Add one with: flow config add-prefix-alias <name> <hex-prefix>")
+        return
+    
+    click.echo(f"🔖 Saved prefix aliases ({len(aliases)}):")
+    click.echo("")
+    
+    for alias_name, hex_prefix in aliases.items():
+        click.echo(f"  {alias_name} -> {hex_prefix}")
+    
+    click.echo("")
+    click.echo("💡 Use with: flow watch <alias>, flow history <alias>, etc.")
+
+@config.command("remove-prefix-alias")
+@click.argument('alias_name')
+def remove_prefix_alias(alias_name):
+    """Remove a prefix alias"""
+    config_data = load_config()
+    aliases = config_data.get("prefix_aliases", {})
+    
+    if alias_name not in aliases:
+        click.echo(f"❌ Alias '{alias_name}' not found", err=True)
+        available = list(aliases.keys())
+        if available:
+            click.echo("Available aliases:", err=True)
+            for alias in available:
+                click.echo(f"  {alias}", err=True)
+        sys.exit(1)
+    
+    hex_prefix = aliases[alias_name]
+    if click.confirm(f"Remove alias '{alias_name}' -> {hex_prefix}?"):
+        del aliases[alias_name]
+        config_data["prefix_aliases"] = aliases
+        save_config(config_data)
+        click.echo(f"✓ Removed alias: {alias_name}")
+    else:
+        click.echo("❌ Cancelled")
 
 @cli.command()
 @click.argument('message')
@@ -532,28 +659,8 @@ async def watch_with_websocket(prefix_or_topic: str):
         click.echo("❌ Not logged in. Use 'flow login' first", err=True)
         sys.exit(1)
     
-    # Determine if this is a topic path or raw hex prefix
-    if all(c in '0123456789abcdefABCDEF' for c in prefix_or_topic) and len(prefix_or_topic) >= 16:
-        # Raw hex prefix
-        prefix = prefix_or_topic.lower()
-        display_name = f"prefix {prefix}"
-    else:
-        # Topic path - compute prefix
-        config_data = load_config()
-        org_id = config_data.get('default_org_id')
-        client_secret = load_client_secret()
-        
-        if not org_id:
-            click.echo("❌ No default organization set. For raw hex prefixes, use full prefix.", err=True)
-            click.echo("❌ For topic paths, run 'flow config create-org' first", err=True)
-            sys.exit(1)
-        
-        if not client_secret:
-            click.echo("❌ No client secret found. Run 'flow config generate-secret' first", err=True)
-            sys.exit(1)
-        
-        prefix = compute_topic_prefix(org_id, prefix_or_topic, client_secret)
-        display_name = f"topic '{prefix_or_topic}'"
+    # Resolve prefix using the new helper
+    prefix, display_name = resolve_prefix_or_topic(prefix_or_topic)
     
     # Convert HTTP URL to WebSocket URL
     ws_url = config['base_url'].replace('http://', 'ws://').replace('https://', 'wss://')
@@ -670,28 +777,8 @@ def watch_with_polling(prefix_or_topic: str):
     config = load_config()
     token = load_token()
     
-    # Determine if this is a topic path or raw hex prefix
-    if all(c in '0123456789abcdefABCDEF' for c in prefix_or_topic) and len(prefix_or_topic) >= 16:
-        # Raw hex prefix
-        prefix = prefix_or_topic.lower()
-        display_name = f"prefix {prefix}"
-    else:
-        # Topic path - compute prefix
-        config_data = load_config()
-        org_id = config_data.get('default_org_id')
-        client_secret = load_client_secret()
-        
-        if not org_id:
-            click.echo("❌ No default organization set. For raw hex prefixes, use full prefix.", err=True)
-            click.echo("❌ For topic paths, run 'flow config create-org' first", err=True)
-            sys.exit(1)
-        
-        if not client_secret:
-            click.echo("❌ No client secret found. Run 'flow config generate-secret' first", err=True)
-            sys.exit(1)
-        
-        prefix = compute_topic_prefix(org_id, prefix_or_topic, client_secret)
-        display_name = f"topic '{prefix_or_topic}'"
+    # Resolve prefix using the new helper
+    prefix, display_name = resolve_prefix_or_topic(prefix_or_topic)
     
     click.echo(f"👀 Watching for events on {display_name} (polling mode)")
     click.echo("   (Ctrl+C to stop)")
@@ -753,25 +840,8 @@ async def nc_listen_websocket(prefix_or_topic: str):
         click.echo("# Error: Not logged in. Use 'flow login' first", err=True)
         sys.exit(1)
     
-    # Determine if this is a topic path or raw hex prefix
-    if all(c in '0123456789abcdefABCDEF' for c in prefix_or_topic) and len(prefix_or_topic) >= 16:
-        # Raw hex prefix
-        prefix = prefix_or_topic.lower()
-    else:
-        # Topic path - compute prefix
-        config_data = load_config()
-        org_id = config_data.get('default_org_id')
-        client_secret = load_client_secret()
-        
-        if not org_id:
-            click.echo("# Error: No default organization set", err=True)
-            sys.exit(1)
-        
-        if not client_secret:
-            click.echo("# Error: No client secret found", err=True)
-            sys.exit(1)
-        
-        prefix = compute_topic_prefix(org_id, prefix_or_topic, client_secret)
+    # Resolve prefix using the new helper (just get the hex prefix)
+    prefix, _ = resolve_prefix_or_topic(prefix_or_topic)
     
     # Convert HTTP URL to WebSocket URL
     ws_url = config['base_url'].replace('http://', 'ws://').replace('https://', 'wss://')
@@ -887,12 +957,18 @@ def nc(prefix_or_topic, listen):
         click.echo("# Send mode: Reading from stdin...", err=True)
         click.echo("# (Ctrl+C to stop, Ctrl+D to end input)", err=True)
         
-        # Determine topic from argument
-        if all(c in '0123456789abcdefABCDEF' for c in prefix_or_topic) and len(prefix_or_topic) >= 16:
-            # Raw hex prefix - can't send to specific prefix, would need topic
-            click.echo("# Error: Cannot send to raw hex prefix. Use topic path instead.", err=True)
+        # Check if this resolves to a hex prefix (can't send to those)
+        config_data = load_config()
+        prefix_aliases = config_data.get("prefix_aliases", {})
+        
+        # If it's a prefix alias or raw hex, can't send to it
+        if (prefix_or_topic in prefix_aliases or 
+            (all(c in '0123456789abcdefABCDEF' for c in prefix_or_topic) and len(prefix_or_topic) >= 16)):
+            click.echo("# Error: Cannot send to hex prefix or prefix alias. Use topic path instead.", err=True)
+            click.echo("# Hint: Use a topic path like 'logs.errors' to send events", err=True)
             sys.exit(1)
         
+        # Must be a topic path
         topic_path = prefix_or_topic
         
         try:
@@ -922,28 +998,8 @@ def history(prefix_or_topic, since, limit, full):
     
     config = load_config()
     
-    # Determine if this is a topic path or raw hex prefix
-    if all(c in '0123456789abcdefABCDEF' for c in prefix_or_topic) and len(prefix_or_topic) >= 16:
-        # Raw hex prefix
-        prefix = prefix_or_topic.lower()
-        display_name = f"prefix {prefix}"
-    else:
-        # Topic path - compute prefix
-        config_data = load_config()
-        org_id = config_data.get('default_org_id')
-        client_secret = load_client_secret()
-        
-        if not org_id:
-            click.echo("❌ No default organization set. For raw hex prefixes, use full prefix.", err=True)
-            click.echo("❌ For topic paths, run 'flow config create-org' first", err=True)
-            sys.exit(1)
-        
-        if not client_secret:
-            click.echo("❌ No client secret found. Run 'flow config generate-secret' first", err=True)
-            sys.exit(1)
-        
-        prefix = compute_topic_prefix(org_id, prefix_or_topic, client_secret)
-        display_name = f"topic '{prefix_or_topic}'"
+    # Resolve prefix using the new helper
+    prefix, display_name = resolve_prefix_or_topic(prefix_or_topic)
     
     # If since is provided and looks like a message ID (hex), convert it to a timestamp
     since_param = None
