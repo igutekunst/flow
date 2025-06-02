@@ -17,7 +17,9 @@ import logging
 app = FastAPI(title="SuperCortex Flow", description="Event Ingestion System")
 
 # Validate admin token is set in environment
-FLOW_ADMIN_TOKEN = os.getenv("FLOW_ADMIN_TOKEN", "eeph8phei5Ahco4ChieJui0aQuieveis3seeth4cah6miepoaveeMeucung2EY1U")
+FLOW_ADMIN_TOKEN = os.getenv("FLOW_ADMIN_TOKEN")
+if not FLOW_ADMIN_TOKEN:
+    raise ValueError("FLOW_ADMIN_TOKEN must be set in the environment")
 
 # Event broker for WebSocket connections
 class EventBroker:
