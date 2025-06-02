@@ -767,8 +767,7 @@ async def nc_listen_websocket(prefix_or_topic: str):
                             data = json.loads(message)
                             
                             if data.get("type") == "connected":
-                                # Send connection info to stderr so it doesn't interfere with stdout piping
-                                click.echo(f"# Connected to prefix: {data['prefix_used']}", err=True)
+                                # Silent startup for netcat-style operation
                                 continue
                             elif data.get("type") == "heartbeat":
                                 # Server heartbeat - just continue
@@ -874,6 +873,115 @@ def nc(prefix_or_topic, listen):
             click.echo("\n# Stopped sending", err=True)
         except EOFError:
             click.echo("# End of input", err=True)
+
+@cli.command()
+@click.argument('prefix_or_topic', required=True)
+@click.option('--since', help='Get events since this timestamp (ISO format) or message ID')
+@click.option('--limit', default=100, help='Maximum number of events to return (default: 100)')
+@click.option('--full', is_flag=True, help='Show full event bodies instead of just metadata')
+def history(prefix_or_topic, since, limit, full):
+    """Get historical events from a prefix (topic path or hex prefix)
+    
+    This retrieves all events from the beginning or since a specified time/message ID.
+    Unlike 'watch', this shows historical events and exits when done.
+    """
+    
+    config = load_config()
+    
+    # Determine if this is a topic path or raw hex prefix
+    if all(c in '0123456789abcdefABCDEF' for c in prefix_or_topic) and len(prefix_or_topic) >= 16:
+        # Raw hex prefix
+        prefix = prefix_or_topic.lower()
+        display_name = f"prefix {prefix}"
+    else:
+        # Topic path - compute prefix
+        config_data = load_config()
+        org_id = config_data.get('default_org_id')
+        client_secret = load_client_secret()
+        
+        if not org_id:
+            click.echo("❌ No default organization set. For raw hex prefixes, use full prefix.", err=True)
+            click.echo("❌ For topic paths, run 'flow config create-org' first", err=True)
+            sys.exit(1)
+        
+        if not client_secret:
+            click.echo("❌ No client secret found. Run 'flow config generate-secret' first", err=True)
+            sys.exit(1)
+        
+        prefix = compute_topic_prefix(org_id, prefix_or_topic, client_secret)
+        display_name = f"topic '{prefix_or_topic}'"
+    
+    # If since is provided and looks like a message ID (hex), convert it to a timestamp
+    since_param = None
+    if since:
+        if all(c in '0123456789abcdefABCDEF' for c in since) and len(since) == 64:
+            # It's a message ID - get that event's timestamp
+            try:
+                event = make_request("GET", f"/events/{since}")
+                since_param = event['timestamp']
+                click.echo(f"📅 Getting events since message {since[:16]}... ({since_param})")
+            except Exception as e:
+                click.echo(f"❌ Error getting timestamp for message ID {since}: {e}", err=True)
+                sys.exit(1)
+        else:
+            # Assume it's already a timestamp
+            since_param = since
+            click.echo(f"📅 Getting events since {since_param}")
+    
+    try:
+        params = {
+            'prefix': prefix,
+            'limit': limit
+        }
+        if since_param:
+            params['since'] = since_param
+        
+        result = make_request("GET", "/events/watch", params=params)
+        
+        # Show the prefix from server
+        click.echo(f"🔍 Searching {display_name}")
+        click.echo(f"   Using prefix: {result['prefix_used']}")
+        
+        events = result['events']
+        
+        if not events:
+            click.echo("📭 No events found")
+            return
+        
+        # Process events in reverse order (oldest first for history)
+        click.echo(f"📋 Found {len(events)} event(s):")
+        
+        for event in reversed(events):
+            if full:
+                # Get the full event with body
+                try:
+                    full_event = make_request("GET", f"/events/{event['id']}")
+                    
+                    # Display event with full body
+                    click.echo(f"🔴 {event['timestamp']} | {event['agent_id']} | {event['id']}")
+                    
+                    # Handle different body formats
+                    if full_event.get('body_format') == 'utf8':
+                        click.echo(f"   📄 {full_event['body']}")
+                    elif full_event.get('body_format') == 'base64':
+                        click.echo(f"   📄 [Base64 data: {full_event.get('body_length', 0)} bytes]")
+                    else:
+                        # Legacy format - assume UTF-8
+                        click.echo(f"   📄 {full_event.get('body', '[No body]')}")
+                    
+                    click.echo()  # Empty line between events
+                    
+                except Exception as e:
+                    click.echo(f"❌ Error fetching full event {event['id']}: {e}", err=True)
+                    # Fall back to metadata only
+                    click.echo(f"🔴 {event['timestamp']} | {event['agent_id']} | {event['body_length']} bytes | {event['id']}")
+            else:
+                # Just show metadata
+                click.echo(f"🔴 {event['timestamp']} | {event['agent_id']} | {event['body_length']} bytes | {event['id']}")
+        
+    except Exception as e:
+        click.echo(f"❌ Error: {e}", err=True)
+        sys.exit(1)
 
 if __name__ == '__main__':
     cli() 
