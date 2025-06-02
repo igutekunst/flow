@@ -7,6 +7,7 @@ setup(
     install_requires=[
         "click>=8.1.0",
         "requests>=2.31.0",
+        "websockets>=12.0",
     ],
     entry_points={
         "console_scripts": [

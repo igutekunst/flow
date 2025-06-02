@@ -1,12 +1,15 @@
-from fastapi import FastAPI, Depends, HTTPException, Header, Query
+from fastapi import FastAPI, Depends, HTTPException, Header, Query, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
 from models import Agent, Event, create_tables, get_db, generate_message, generate_id
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List, Dict, Set
 from datetime import datetime
 import os
 import secrets
 import base64
+import asyncio
+import json
+import logging
 
 app = FastAPI(title="SuperCortex Flow", description="Event Ingestion System")
 
@@ -15,6 +18,42 @@ FLOW_ADMIN_TOKEN = os.getenv("FLOW_ADMIN_TOKEN")
 if not FLOW_ADMIN_TOKEN:
     raise ValueError("FLOW_ADMIN_TOKEN must be set in the environment")
 
+# Event broker for WebSocket connections
+class EventBroker:
+    def __init__(self):
+        self.connections: Dict[str, List[WebSocket]] = {}  # prefix_hex -> [websockets]
+        
+    async def connect(self, websocket: WebSocket, prefix_hex: str):
+        await websocket.accept()
+        if prefix_hex not in self.connections:
+            self.connections[prefix_hex] = []
+        self.connections[prefix_hex].append(websocket)
+        
+    def disconnect(self, websocket: WebSocket, prefix_hex: str):
+        if prefix_hex in self.connections:
+            self.connections[prefix_hex].remove(websocket)
+            if not self.connections[prefix_hex]:
+                del self.connections[prefix_hex]
+                
+    async def broadcast_event(self, event_data: dict, event_id: str):
+        """Broadcast event to all relevant WebSocket connections"""
+        disconnected_connections = []
+        
+        for prefix_hex, websockets in self.connections.items():
+            if matches_prefix(event_id, prefix_hex):
+                for websocket in websockets[:]:  # Copy list to avoid modification during iteration
+                    try:
+                        await websocket.send_text(json.dumps(event_data))
+                    except Exception as e:
+                        logging.warning(f"WebSocket send failed: {e}")
+                        disconnected_connections.append((websocket, prefix_hex))
+        
+        # Clean up disconnected connections
+        for websocket, prefix_hex in disconnected_connections:
+            self.disconnect(websocket, prefix_hex)
+
+# Global event broker instance
+event_broker = EventBroker()
 
 def safe_display_body(body_bytes: bytes) -> dict:
     """
@@ -133,11 +172,82 @@ async def create_event(event: EventCreate, current_agent=Depends(get_current_age
     db.add(new_event)
     db.commit()
     
+    # Broadcast to WebSocket connections
+    event_data = {
+        "id": new_event.id,
+        "agent_id": new_event.agent_id,
+        "timestamp": new_event.timestamp.isoformat() + 'Z',
+        "body_length": len(new_event.body) if new_event.body else 0
+    }
+    await event_broker.broadcast_event(event_data, new_event.id)
+    
     return {
         "id": new_event.id,
         "agent_id": new_event.agent_id,
         "timestamp": new_event.timestamp.isoformat() + 'Z'
     }
+
+@app.websocket("/events/watch_ws")
+async def websocket_watch_events(
+    websocket: WebSocket,
+    prefix: str = Query(..., description="Prefix to watch for"),
+    prefix_format: str = Query('utf8', description="Format of prefix: utf8, hex, or base64"),
+    token: str = Query(..., description="Authorization token")
+):
+    """WebSocket endpoint for real-time event watching"""
+    
+    # Authenticate the WebSocket connection
+    try:
+        # Check if it's the admin token
+        if token == FLOW_ADMIN_TOKEN:
+            current_agent = {"id": "admin", "is_admin": True, "prefix": None}
+        else:
+            # Check if it's a valid agent token
+            db = next(get_db())
+            agent = db.query(Agent).filter(Agent.token == token).first()
+            if not agent:
+                await websocket.close(code=1008, reason="Invalid token")
+                return
+            current_agent = {"id": agent.id, "is_admin": False, "prefix": agent.prefix}
+    except Exception as e:
+        await websocket.close(code=1011, reason="Authentication failed")
+        return
+    
+    # Parse and validate prefix
+    try:
+        padded_prefix_hex = parse_prefix_server(prefix, prefix_format)
+    except HTTPException as e:
+        await websocket.close(code=1008, reason=str(e.detail))
+        return
+    
+    # Connect to event broker
+    await event_broker.connect(websocket, padded_prefix_hex)
+    
+    try:
+        # Send initial confirmation
+        await websocket.send_text(json.dumps({
+            "type": "connected",
+            "prefix_used": padded_prefix_hex,
+            "message": f"Watching for events with prefix: {prefix} (padded to {padded_prefix_hex})"
+        }))
+        
+        # Keep connection alive and handle disconnection
+        while True:
+            try:
+                # Wait for ping/pong or other messages from client
+                await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+            except asyncio.TimeoutError:
+                # Send ping to keep connection alive
+                await websocket.ping()
+            except WebSocketDisconnect:
+                break
+                
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logging.error(f"WebSocket error: {e}")
+    finally:
+        event_broker.disconnect(websocket, padded_prefix_hex)
 
 @app.get("/events/watch")
 async def watch_events(

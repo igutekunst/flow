@@ -5,6 +5,9 @@ import os
 import requests
 import time
 import base64
+import asyncio
+import websockets
+import urllib.parse
 from pathlib import Path
 from datetime import datetime
 
@@ -225,19 +228,85 @@ def agent_cmd(subcommand, prefix, prefix_format):
     else:
         click.echo(f"❌ Unknown agent subcommand: {subcommand}", err=True)
 
+async def watch_with_websocket(prefix: str, format_type: str):
+    """Watch for events using WebSocket connection for real-time updates"""
+    config = load_config()
+    token = load_token()
+    
+    if not token:
+        click.echo("❌ Not logged in. Use 'flow login' first", err=True)
+        sys.exit(1)
+    
+    # Convert HTTP URL to WebSocket URL
+    ws_url = config['base_url'].replace('http://', 'ws://').replace('https://', 'wss://')
+    
+    # Build WebSocket URL with query parameters
+    query_params = urllib.parse.urlencode({
+        'prefix': prefix,
+        'prefix_format': format_type,
+        'token': token
+    })
+    full_ws_url = f"{ws_url}/events/watch_ws?{query_params}"
+    
+    click.echo(f"👀 Watching for events with prefix: '{prefix}' ({format_type} format)")
+    click.echo("   Connecting via WebSocket for real-time updates... (Ctrl+C to stop)")
+    
+    try:
+        async with websockets.connect(full_ws_url) as websocket:
+            async for message in websocket:
+                try:
+                    data = json.loads(message)
+                    
+                    if data.get("type") == "connected":
+                        click.echo(f"   Connected! Padded prefix: {data['prefix_used']}")
+                        continue
+                    
+                    # This is an event
+                    event_time = data['timestamp']
+                    agent_id = data['agent_id']
+                    body_length = data['body_length']
+                    event_id = data['id']
+                    
+                    click.echo(f"🔴 {event_time} | {agent_id} | {body_length} bytes | {event_id}")
+                    
+                except json.JSONDecodeError:
+                    click.echo(f"❌ Invalid message received: {message}", err=True)
+                except KeyError as e:
+                    click.echo(f"❌ Missing field in message: {e}", err=True)
+                    
+    except websockets.exceptions.ConnectionClosedError as e:
+        click.echo(f"❌ WebSocket connection closed: {e}", err=True)
+    except websockets.exceptions.InvalidURI:
+        click.echo(f"❌ Invalid WebSocket URL: {full_ws_url}", err=True)
+    except Exception as e:
+        click.echo(f"❌ WebSocket error: {e}", err=True)
+
 @cli.command()
 @click.argument('prefix', required=True)
 @click.option('--hex', 'format_type', flag_value='hex', help='Interpret prefix as hex')
 @click.option('--base64', 'format_type', flag_value='base64', help='Interpret prefix as base64')
-def watch(prefix, format_type):
-    """Watch for new events with specific prefix (server enforces 64-bit padding)"""
+@click.option('--poll', is_flag=True, help='Use polling instead of WebSocket (fallback mode)')
+def watch(prefix, format_type, poll):
+    """Watch for new events with specific prefix (real-time via WebSocket)"""
     
     # Default to UTF-8 if no format specified
     if format_type is None:
         format_type = 'utf8'
     
+    if poll:
+        # Use the old polling method as fallback
+        watch_with_polling(prefix, format_type)
+    else:
+        # Use WebSocket for real-time updates
+        try:
+            asyncio.run(watch_with_websocket(prefix, format_type))
+        except KeyboardInterrupt:
+            click.echo("\n👋 Stopped watching")
+
+def watch_with_polling(prefix: str, format_type: str):
+    """Original polling implementation (kept as fallback)"""
     click.echo(f"👀 Watching for events with prefix: '{prefix}' ({format_type} format)")
-    click.echo("   Server will pad to 64-bits. (Ctrl+C to stop)")
+    click.echo("   Server will pad to 64-bits. Using polling mode. (Ctrl+C to stop)")
     
     last_timestamp = None
     try:
@@ -288,6 +357,111 @@ def watch(prefix, format_type):
                 
     except KeyboardInterrupt:
         click.echo("\n👋 Stopped watching")
+
+async def nc_listen_websocket(prefix: str, format_type: str):
+    """Netcat-style listen mode using WebSocket - streams raw event bodies to stdout"""
+    config = load_config()
+    token = load_token()
+    
+    if not token:
+        click.echo("❌ Not logged in. Use 'flow login' first", err=True)
+        sys.exit(1)
+    
+    # Convert HTTP URL to WebSocket URL
+    ws_url = config['base_url'].replace('http://', 'ws://').replace('https://', 'wss://')
+    
+    # Build WebSocket URL with query parameters
+    query_params = urllib.parse.urlencode({
+        'prefix': prefix,
+        'prefix_format': format_type,
+        'token': token
+    })
+    full_ws_url = f"{ws_url}/events/watch_ws?{query_params}"
+    
+    try:
+        async with websockets.connect(full_ws_url) as websocket:
+            async for message in websocket:
+                try:
+                    data = json.loads(message)
+                    
+                    if data.get("type") == "connected":
+                        # Send connection info to stderr so it doesn't interfere with stdout piping
+                        click.echo(f"# Connected to prefix: {data['prefix_used']}", err=True)
+                        continue
+                    
+                    # For nc mode, we need to get the actual event body
+                    # The WebSocket only sends metadata, so we need to fetch the full event
+                    event_id = data['id']
+                    
+                    # Fetch the full event to get the body
+                    try:
+                        event = make_request("GET", f"/events/{event_id}")
+                        
+                        # Output just the raw body to stdout (perfect for piping)
+                        if event.get('body_format') == 'utf8':
+                            print(event['body'])
+                        elif event.get('body_format') == 'base64':
+                            # Decode base64 and output raw bytes
+                            import base64
+                            raw_bytes = base64.b64decode(event['body'])
+                            sys.stdout.buffer.write(raw_bytes)
+                            sys.stdout.buffer.write(b'\n')
+                        else:
+                            # Legacy format - assume UTF-8
+                            print(event['body'])
+                            
+                        sys.stdout.flush()
+                        
+                    except Exception as e:
+                        click.echo(f"# Error fetching event {event_id}: {e}", err=True)
+                    
+                except json.JSONDecodeError:
+                    click.echo(f"# Invalid message received", err=True)
+                except KeyError as e:
+                    click.echo(f"# Missing field in message: {e}", err=True)
+                    
+    except websockets.exceptions.ConnectionClosedError as e:
+        click.echo(f"# WebSocket connection closed: {e}", err=True)
+    except websockets.exceptions.InvalidURI:
+        click.echo(f"# Invalid WebSocket URL: {full_ws_url}", err=True)
+    except Exception as e:
+        click.echo(f"# WebSocket error: {e}", err=True)
+
+@cli.command()
+@click.argument('prefix', required=True)
+@click.option('-l', '--listen', is_flag=True, help='Listen mode - stream event bodies to stdout (netcat-style)')
+@click.option('--hex', 'format_type', flag_value='hex', help='Interpret prefix as hex')
+@click.option('--base64', 'format_type', flag_value='base64', help='Interpret prefix as base64')
+def nc(prefix, listen, format_type):
+    """Netcat-style event streaming - raw bodies for scripting/piping"""
+    
+    # Default to UTF-8 if no format specified
+    if format_type is None:
+        format_type = 'utf8'
+    
+    if listen:
+        # Listen mode - stream events to stdout
+        try:
+            asyncio.run(nc_listen_websocket(prefix, format_type))
+        except KeyboardInterrupt:
+            click.echo("\n# Stopped listening", err=True)
+    else:
+        # Send mode - read from stdin and send as events
+        click.echo("# Send mode: Reading from stdin...", err=True)
+        click.echo("# (Ctrl+C to stop, Ctrl+D to end input)", err=True)
+        
+        try:
+            for line in sys.stdin:
+                line = line.rstrip('\n\r')
+                if line:  # Skip empty lines
+                    try:
+                        add_event_with_prefix(line, prefix, format_type)
+                    except Exception as e:
+                        click.echo(f"# Error sending event: {e}", err=True)
+        except KeyboardInterrupt:
+            click.echo("\n# Stopped sending", err=True)
+        except EOFError:
+            click.echo("# End of input", err=True)
 
 if __name__ == '__main__':
     cli() 
