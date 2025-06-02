@@ -490,7 +490,7 @@ def share_topic(topic_path, copy):
         sys.exit(1)
 
 async def watch_with_websocket(prefix_or_topic: str):
-    """Watch for events using WebSocket connection for real-time updates"""
+    """Watch for events using WebSocket connection with heartbeats and auto-reconnection"""
     config = load_config()
     token = load_token()
     
@@ -532,37 +532,88 @@ async def watch_with_websocket(prefix_or_topic: str):
     full_ws_url = f"{ws_url}/events/watch_ws?{query_params}"
     
     click.echo(f"👀 Watching for events on {display_name}")
-    click.echo("   Connecting via WebSocket for real-time updates... (Ctrl+C to stop)")
+    click.echo("   Connecting via WebSocket with auto-reconnection... (Ctrl+C to stop)")
     
-    try:
-        async with websockets.connect(full_ws_url) as websocket:
-            async for message in websocket:
+    reconnect_delay = 1  # Start with 1 second, exponential backoff
+    max_reconnect_delay = 60  # Max 60 seconds between reconnect attempts
+    
+    while True:
+        try:
+            async with websockets.connect(full_ws_url, ping_interval=20, ping_timeout=10) as websocket:
+                # Reset reconnect delay on successful connection
+                reconnect_delay = 1
+                
+                # Set up heartbeat task
+                heartbeat_task = asyncio.create_task(heartbeat_sender(websocket))
+                
                 try:
-                    data = json.loads(message)
-                    
-                    if data.get("type") == "connected":
-                        click.echo(f"   Connected! Using prefix: {data['prefix_used']}")
-                        continue
-                    
-                    # This is an event
-                    event_time = data['timestamp']
-                    agent_id = data['agent_id']
-                    body_length = data['body_length']
-                    event_id = data['id']
-                    
-                    click.echo(f"🔴 {event_time} | {agent_id} | {body_length} bytes | {event_id}")
-                    
-                except json.JSONDecodeError:
-                    click.echo(f"❌ Invalid message received: {message}", err=True)
-                except KeyError as e:
-                    click.echo(f"❌ Missing field in message: {e}", err=True)
-                    
-    except websockets.exceptions.ConnectionClosedError as e:
-        click.echo(f"❌ WebSocket connection closed: {e}", err=True)
-    except websockets.exceptions.InvalidURI:
-        click.echo(f"❌ Invalid WebSocket URL: {full_ws_url}", err=True)
-    except Exception as e:
-        click.echo(f"❌ WebSocket error: {e}", err=True)
+                    async for message in websocket:
+                        try:
+                            data = json.loads(message)
+                            
+                            if data.get("type") == "connected":
+                                click.echo(f"   ✓ Connected! Using prefix: {data['prefix_used']}")
+                                continue
+                            elif data.get("type") == "heartbeat":
+                                # Server heartbeat - just continue
+                                continue
+                            elif data.get("type") == "pong":
+                                # Response to our ping - just continue
+                                continue
+                            
+                            # This is an event
+                            event_time = data['timestamp']
+                            agent_id = data['agent_id']
+                            body_length = data['body_length']
+                            event_id = data['id']
+                            
+                            click.echo(f"🔴 {event_time} | {agent_id} | {body_length} bytes | {event_id}")
+                            
+                        except json.JSONDecodeError:
+                            click.echo(f"❌ Invalid message received: {message}", err=True)
+                        except KeyError as e:
+                            click.echo(f"❌ Missing field in message: {e}", err=True)
+                            
+                except websockets.exceptions.ConnectionClosedError as e:
+                    click.echo(f"   ⚠️  Connection closed: {e.reason if e.reason else 'Unknown reason'}")
+                    raise  # Re-raise to trigger reconnection
+                finally:
+                    heartbeat_task.cancel()
+                    try:
+                        await heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
+                        
+        except websockets.exceptions.InvalidURI:
+            click.echo(f"❌ Invalid WebSocket URL: {full_ws_url}", err=True)
+            break
+        except KeyboardInterrupt:
+            click.echo("\n👋 Stopped watching")
+            break
+        except Exception as e:
+            click.echo(f"   ⚠️  Connection error: {e}")
+            
+        # Exponential backoff for reconnection
+        click.echo(f"   🔄 Reconnecting in {reconnect_delay} seconds...")
+        try:
+            await asyncio.sleep(reconnect_delay)
+        except KeyboardInterrupt:
+            click.echo("\n👋 Stopped watching")
+            break
+            
+        reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
+
+async def heartbeat_sender(websocket):
+    """Send periodic heartbeats to keep connection alive"""
+    try:
+        while True:
+            await asyncio.sleep(30)  # Send heartbeat every 30 seconds
+            try:
+                await websocket.send(json.dumps({"type": "ping", "timestamp": datetime.utcnow().isoformat() + 'Z'}))
+            except websockets.exceptions.ConnectionClosed:
+                break
+    except asyncio.CancelledError:
+        pass
 
 @cli.command()
 @click.argument('prefix_or_topic', required=True)
@@ -660,7 +711,7 @@ def watch_with_polling(prefix_or_topic: str):
         click.echo("\n👋 Stopped watching")
 
 async def nc_listen_websocket(prefix_or_topic: str):
-    """Netcat-style listen mode using WebSocket - streams raw event bodies to stdout"""
+    """Netcat-style listen mode using WebSocket with heartbeats and auto-reconnection"""
     config = load_config()
     token = load_token()
     
@@ -698,54 +749,93 @@ async def nc_listen_websocket(prefix_or_topic: str):
     })
     full_ws_url = f"{ws_url}/events/watch_ws?{query_params}"
     
-    try:
-        async with websockets.connect(full_ws_url) as websocket:
-            async for message in websocket:
+    reconnect_delay = 1  # Start with 1 second, exponential backoff
+    max_reconnect_delay = 60  # Max 60 seconds between reconnect attempts
+    
+    while True:
+        try:
+            async with websockets.connect(full_ws_url, ping_interval=20, ping_timeout=10) as websocket:
+                # Reset reconnect delay on successful connection
+                reconnect_delay = 1
+                
+                # Set up heartbeat task
+                heartbeat_task = asyncio.create_task(heartbeat_sender(websocket))
+                
                 try:
-                    data = json.loads(message)
-                    
-                    if data.get("type") == "connected":
-                        # Send connection info to stderr so it doesn't interfere with stdout piping
-                        click.echo(f"# Connected to prefix: {data['prefix_used']}", err=True)
-                        continue
-                    
-                    # For nc mode, we need to get the actual event body
-                    # The WebSocket only sends metadata, so we need to fetch the full event
-                    event_id = data['id']
-                    
-                    # Fetch the full event to get the body
-                    try:
-                        event = make_request("GET", f"/events/{event_id}")
-                        
-                        # Output just the raw body to stdout (perfect for piping)
-                        if event.get('body_format') == 'utf8':
-                            print(event['body'])
-                        elif event.get('body_format') == 'base64':
-                            # Decode base64 and output raw bytes
-                            import base64
-                            raw_bytes = base64.b64decode(event['body'])
-                            sys.stdout.buffer.write(raw_bytes)
-                            sys.stdout.buffer.write(b'\n')
-                        else:
-                            # Legacy format - assume UTF-8
-                            print(event['body'])
+                    async for message in websocket:
+                        try:
+                            data = json.loads(message)
                             
-                        sys.stdout.flush()
+                            if data.get("type") == "connected":
+                                # Send connection info to stderr so it doesn't interfere with stdout piping
+                                click.echo(f"# Connected to prefix: {data['prefix_used']}", err=True)
+                                continue
+                            elif data.get("type") == "heartbeat":
+                                # Server heartbeat - just continue
+                                continue
+                            elif data.get("type") == "pong":
+                                # Response to our ping - just continue
+                                continue
+                            
+                            # For nc mode, we need to get the actual event body
+                            # The WebSocket only sends metadata, so we need to fetch the full event
+                            event_id = data['id']
+                            
+                            # Fetch the full event to get the body
+                            try:
+                                event = make_request("GET", f"/events/{event_id}")
+                                
+                                # Output just the raw body to stdout (perfect for piping)
+                                if event.get('body_format') == 'utf8':
+                                    print(event['body'])
+                                elif event.get('body_format') == 'base64':
+                                    # Decode base64 and output raw bytes
+                                    import base64
+                                    raw_bytes = base64.b64decode(event['body'])
+                                    sys.stdout.buffer.write(raw_bytes)
+                                    sys.stdout.buffer.write(b'\n')
+                                else:
+                                    # Legacy format - assume UTF-8
+                                    print(event['body'])
+                                    
+                                sys.stdout.flush()
+                                
+                            except Exception as e:
+                                click.echo(f"# Error fetching event {event_id}: {e}", err=True)
+                            
+                        except json.JSONDecodeError:
+                            click.echo(f"# Invalid message received", err=True)
+                        except KeyError as e:
+                            click.echo(f"# Missing field in message: {e}", err=True)
+                            
+                except websockets.exceptions.ConnectionClosedError as e:
+                    click.echo(f"# Connection closed: {e.reason if e.reason else 'Unknown reason'}", err=True)
+                    raise  # Re-raise to trigger reconnection
+                finally:
+                    heartbeat_task.cancel()
+                    try:
+                        await heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
                         
-                    except Exception as e:
-                        click.echo(f"# Error fetching event {event_id}: {e}", err=True)
-                    
-                except json.JSONDecodeError:
-                    click.echo(f"# Invalid message received", err=True)
-                except KeyError as e:
-                    click.echo(f"# Missing field in message: {e}", err=True)
-                    
-    except websockets.exceptions.ConnectionClosedError as e:
-        click.echo(f"# WebSocket connection closed: {e}", err=True)
-    except websockets.exceptions.InvalidURI:
-        click.echo(f"# Invalid WebSocket URL: {full_ws_url}", err=True)
-    except Exception as e:
-        click.echo(f"# WebSocket error: {e}", err=True)
+        except websockets.exceptions.InvalidURI:
+            click.echo(f"# Invalid WebSocket URL: {full_ws_url}", err=True)
+            break
+        except KeyboardInterrupt:
+            click.echo("# Stopped listening", err=True)
+            break
+        except Exception as e:
+            click.echo(f"# Connection error: {e}", err=True)
+            
+        # Exponential backoff for reconnection
+        click.echo(f"# Reconnecting in {reconnect_delay} seconds...", err=True)
+        try:
+            await asyncio.sleep(reconnect_delay)
+        except KeyboardInterrupt:
+            click.echo("# Stopped listening", err=True)
+            break
+            
+        reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
 
 @cli.command()
 @click.argument('prefix_or_topic', required=True)

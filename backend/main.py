@@ -169,7 +169,7 @@ async def websocket_watch_events(
     prefix: str = Query(..., description="Prefix to watch for (hex)"),
     token: str = Query(..., description="Authorization token")
 ):
-    """WebSocket endpoint for real-time event watching"""
+    """WebSocket endpoint for real-time event watching with heartbeat support"""
     
     # Authenticate the WebSocket connection
     try:
@@ -206,23 +206,73 @@ async def websocket_watch_events(
             "message": f"Watching for events with prefix: {prefix}"
         }))
         
-        # Keep connection alive and handle disconnection
-        while True:
+        # Set up server heartbeat task
+        heartbeat_task = asyncio.create_task(server_heartbeat_sender(websocket))
+        
+        try:
+            # Keep connection alive and handle client messages
+            while True:
+                try:
+                    # Wait for messages from client (including heartbeats)
+                    message = await asyncio.wait_for(websocket.receive_text(), timeout=60.0)
+                    
+                    try:
+                        data = json.loads(message)
+                        if data.get("type") == "ping":
+                            # Respond to client heartbeat
+                            await websocket.send_text(json.dumps({
+                                "type": "pong",
+                                "timestamp": datetime.utcnow().isoformat() + 'Z'
+                            }))
+                        # Handle other message types here if needed
+                    except json.JSONDecodeError:
+                        # Ignore malformed messages
+                        pass
+                        
+                except asyncio.TimeoutError:
+                    # No message received in 60 seconds - check if connection is still alive
+                    try:
+                        await websocket.ping()
+                    except Exception:
+                        # Connection is dead
+                        break
+                except WebSocketDisconnect:
+                    break
+                    
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:
+            logging.error(f"WebSocket error: {e}")
+        finally:
+            # Clean up heartbeat task
+            heartbeat_task.cancel()
             try:
-                # Wait for ping/pong or other messages from client
-                await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
-            except asyncio.TimeoutError:
-                # Send ping to keep connection alive
-                await websocket.ping()
-            except WebSocketDisconnect:
-                break
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
                 
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        logging.error(f"WebSocket error: {e}")
+        logging.error(f"WebSocket setup error: {e}")
     finally:
         event_broker.disconnect(websocket, prefix.lower())
+
+async def server_heartbeat_sender(websocket: WebSocket):
+    """Send periodic heartbeats from server to client"""
+    try:
+        while True:
+            await asyncio.sleep(45)  # Send heartbeat every 45 seconds
+            try:
+                await websocket.send_text(json.dumps({
+                    "type": "heartbeat",
+                    "timestamp": datetime.utcnow().isoformat() + 'Z'
+                }))
+            except Exception:
+                # Connection is closed
+                break
+    except asyncio.CancelledError:
+        pass
 
 @app.get("/events/watch")
 async def watch_events(
