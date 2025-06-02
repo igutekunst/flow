@@ -1,0 +1,313 @@
+import click
+import json
+import sys
+import os
+import requests
+import time
+import base64
+from pathlib import Path
+from datetime import datetime
+
+CONFIG_DIR = Path.home() / ".flow"
+TOKEN_FILE = CONFIG_DIR / "token"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+def ensure_config_dir():
+    CONFIG_DIR.mkdir(exist_ok=True)
+
+def load_config():
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE) as f:
+            return json.load(f)
+    return {"base_url": "http://localhost:2222"}
+
+def save_config(config):
+    ensure_config_dir()
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(config, f, indent=2)
+
+def load_token():
+    if TOKEN_FILE.exists():
+        return TOKEN_FILE.read_text().strip()
+    return None
+
+def save_token(token):
+    ensure_config_dir()
+    TOKEN_FILE.write_text(token)
+    TOKEN_FILE.chmod(0o600)  # Secure permissions
+
+def parse_prefix(prefix_input: str, format_type: str = 'utf8') -> str:
+    """
+    Parse prefix input and convert to hex string (up to 8 bytes).
+    Pads with zeros on the right side if needed for watch, 
+    but for agent/event creation, uses actual length.
+    
+    Args:
+        prefix_input: The input prefix string
+        format_type: 'utf8', 'hex', or 'base64'
+    
+    Returns:
+        hex string (up to 16 characters for 8 bytes)
+    """
+    if format_type == 'utf8':
+        # Convert UTF-8 string to bytes
+        prefix_bytes = prefix_input.encode('utf-8')
+    elif format_type == 'hex':
+        # Parse hex string to bytes
+        try:
+            # Remove any spaces or common separators
+            clean_hex = prefix_input.replace(' ', '').replace('-', '').replace(':', '')
+            prefix_bytes = bytes.fromhex(clean_hex)
+        except ValueError:
+            raise click.ClickException(f"Invalid hex format: {prefix_input}")
+    elif format_type == 'base64':
+        # Parse base64 string to bytes
+        try:
+            prefix_bytes = base64.b64decode(prefix_input)
+        except Exception:
+            raise click.ClickException(f"Invalid base64 format: {prefix_input}")
+    else:
+        raise click.ClickException(f"Unknown format: {format_type}")
+    
+    if len(prefix_bytes) > 8:
+        raise click.ClickException(f"Prefix too long: {len(prefix_bytes)} bytes (max 8 bytes)")
+    
+    # Convert to hex string (no padding for agent/event creation)
+    return prefix_bytes.hex()
+
+def parse_prefix_for_watch(prefix_input: str, format_type: str = 'utf8') -> str:
+    """
+    Parse prefix for watch command - always pads to 64 bits.
+    """
+    prefix_hex = parse_prefix(prefix_input, format_type)
+    prefix_bytes = bytes.fromhex(prefix_hex)
+    
+    # Pad with zeros on the right to make 8 bytes (64 bits) for watch
+    padded_bytes = prefix_bytes + b'\x00' * (8 - len(prefix_bytes))
+    return padded_bytes.hex()
+
+def matches_prefix(event_id: str, prefix_hex: str) -> bool:
+    """Check if event ID starts with the given prefix."""
+    return event_id.lower().startswith(prefix_hex.lower())
+
+def add_event_with_prefix(message: str, prefix: str = None, format_type: str = 'utf8'):
+    """Add an event, optionally with a prefix override."""
+    try:
+        data = {"body": message}
+        if prefix:
+            prefix_hex = parse_prefix(prefix, format_type)
+            data["prefix_override"] = prefix_hex
+            
+        result = make_request("POST", "/events", data)
+        prefix_info = f" (prefix: {prefix})" if prefix else ""
+        click.echo(f"✓ Event added{prefix_info}: {result['id']}")
+    except Exception as e:
+        click.echo(f"❌ Error: {e}", err=True)
+        sys.exit(1)
+
+def make_request(method, endpoint, data=None, params=None):
+    token = load_token()
+    if not token:
+        click.echo("❌ Not logged in. Use 'flow login <token>' first", err=True)
+        sys.exit(1)
+    
+    config = load_config()
+    url = f"{config['base_url']}{endpoint}"
+    headers = {"Authorization": f"Bearer {token}"}
+    
+    if method == "POST":
+        response = requests.post(url, json=data, headers=headers, params=params)
+    elif method == "GET":
+        response = requests.get(url, headers=headers, params=params)
+    else:
+        raise ValueError(f"Unsupported method: {method}")
+    
+    if not response.ok:
+        try:
+            error_detail = response.json().get("detail", "Unknown error")
+        except:
+            error_detail = response.text
+        raise Exception(f"HTTP {response.status_code}: {error_detail}")
+    
+    return response.json()
+
+@click.group(invoke_without_command=True)
+@click.pass_context
+@click.option('-p', '--prefix', help='Prefix for event (UTF-8 by default)')
+@click.option('--hex', 'prefix_format', flag_value='hex', help='Interpret prefix as hex')
+@click.option('--base64', 'prefix_format', flag_value='base64', help='Interpret prefix as base64')
+def cli(ctx, prefix, prefix_format):
+    """SuperCortex Flow CLI - Event ingestion system"""
+    # If no subcommand is provided, check for stdin input
+    if ctx.invoked_subcommand is None:
+        # Check if there's stdin data available
+        if not sys.stdin.isatty():
+            # Read from stdin
+            stdin_content = sys.stdin.read().strip()
+            if stdin_content:
+                format_type = prefix_format or 'utf8'
+                add_event_with_prefix(stdin_content, prefix, format_type)
+            else:
+                click.echo("❌ No input provided", err=True)
+                sys.exit(1)
+        else:
+            # No stdin and no subcommand, show help
+            click.echo(ctx.get_help())
+
+@cli.command()
+@click.argument('token')
+def login(token):
+    """Login with admin token or agent token"""
+    save_token(token)
+    click.echo("✓ Logged in successfully")
+
+@cli.command()
+@click.argument('message')
+@click.option('-p', '--prefix', help='Prefix for event (UTF-8 by default)')
+@click.option('--hex', 'prefix_format', flag_value='hex', help='Interpret prefix as hex')
+@click.option('--base64', 'prefix_format', flag_value='base64', help='Interpret prefix as base64')
+def add(message, prefix, prefix_format):
+    """Add an event to the stream"""
+    format_type = prefix_format or 'utf8'
+    add_event_with_prefix(message, prefix, format_type)
+
+@cli.command()
+@click.argument('event_id')
+def get(event_id):
+    """Get a specific event by ID"""
+    try:
+        event = make_request("GET", f"/events/{event_id}")
+        click.echo(f"Event ID: {event['id']}")
+        click.echo(f"Agent: {event['agent_id']}")
+        click.echo(f"Timestamp: {event['timestamp']}")
+        click.echo(f"Length: {event['body_length']} bytes")
+        
+        # Show format type
+        format_type = event.get('body_format', 'unknown')
+        if format_type == 'utf8':
+            click.echo(f"Format: UTF-8 text")
+            click.echo(f"Body:")
+            click.echo(event['body'])
+        elif format_type == 'base64':
+            click.echo(f"Format: Binary (base64 encoded)")
+            click.echo(f"Body (base64):")
+            click.echo(event['body'])
+        else:
+            # Legacy format
+            click.echo(f"Body:")
+            click.echo(event['body'])
+            
+    except Exception as e:
+        click.echo(f"❌ Error: {e}", err=True)
+        sys.exit(1)
+
+@cli.command("agent")
+@click.argument('subcommand')
+@click.option('--prefix', help='Prefix for agent (UTF-8 by default)')
+@click.option('--hex', 'prefix_format', flag_value='hex', help='Interpret prefix as hex')
+@click.option('--base64', 'prefix_format', flag_value='base64', help='Interpret prefix as base64')
+def agent_cmd(subcommand, prefix, prefix_format):
+    """Agent management"""
+    if subcommand == "create":
+        try:
+            data = {}
+            if prefix:
+                format_type = prefix_format or 'utf8'
+                try:
+                    prefix_hex = parse_prefix(prefix, format_type)
+                    data["prefix"] = prefix_hex
+                except click.ClickException as e:
+                    click.echo(f"❌ {e}", err=True)
+                    sys.exit(1)
+            
+            result = make_request("POST", "/agents", data)
+            click.echo(f"✓ Agent created:")
+            click.echo(f"  ID: {result['id']}")
+            click.echo(f"  Token: {result['token']}")
+            if result.get('prefix'):
+                click.echo(f"  Prefix: {result['prefix']}")
+        except Exception as e:
+            click.echo(f"❌ Error: {e}", err=True)
+            sys.exit(1)
+    else:
+        click.echo(f"❌ Unknown agent subcommand: {subcommand}", err=True)
+
+@cli.command()
+def events():
+    """List recent events"""
+    try:
+        events = make_request("GET", "/events")
+        if not events:
+            click.echo("No events found")
+            return
+        
+        for event in events:
+            click.echo(f"{event['timestamp']} | {event['agent_id']} | {event['body_length']} bytes | {event['id']}")
+    except Exception as e:
+        click.echo(f"❌ Error: {e}", err=True)
+        sys.exit(1)
+
+@cli.command()
+@click.argument('prefix', required=True)
+@click.option('--hex', 'format_type', flag_value='hex', help='Interpret prefix as hex')
+@click.option('--base64', 'format_type', flag_value='base64', help='Interpret prefix as base64')
+def watch(prefix, format_type):
+    """Watch for new events with specific 64-bit prefix (UTF-8 by default)"""
+    
+    # Default to UTF-8 if no format specified
+    if format_type is None:
+        format_type = 'utf8'
+    
+    try:
+        # Parse and pad prefix to 64 bits for watching
+        prefix_hex = parse_prefix_for_watch(prefix, format_type)
+        
+        click.echo(f"👀 Watching for events with prefix: {prefix_hex} ({format_type} input: '{prefix}')")
+        click.echo("   (Ctrl+C to stop)")
+        
+    except click.ClickException as e:
+        click.echo(f"❌ {e}", err=True)
+        sys.exit(1)
+    
+    last_timestamp = None
+    try:
+        while True:
+            try:
+                params = {}
+                if last_timestamp:
+                    params['since'] = last_timestamp
+                
+                events = make_request("GET", "/events", params=params)
+                
+                # Filter events by prefix and process in reverse order (oldest first)
+                for event in reversed(events):
+                    if matches_prefix(event['id'], prefix_hex):
+                        event_time = event['timestamp']
+                        if last_timestamp is None or event_time > last_timestamp:
+                            click.echo(f"🔴 {event_time} | {event['agent_id']} | {event['body_length']} bytes | {event['id']}")
+                            last_timestamp = event_time
+                
+                # Update timestamp even if no matching events found
+                if events:
+                    all_timestamps = [event['timestamp'] for event in events]
+                    latest = max(all_timestamps)
+                    if last_timestamp is None or latest > last_timestamp:
+                        last_timestamp = latest
+                elif last_timestamp is None:
+                    # First run, set timestamp to now
+                    last_timestamp = datetime.utcnow().isoformat() + 'Z'
+                
+                time.sleep(1)  # Poll every second
+                
+            except KeyboardInterrupt:
+                click.echo("\n👋 Stopped watching")
+                break
+            except Exception as e:
+                click.echo(f"❌ Error: {e}", err=True)
+                time.sleep(5)  # Wait longer on error
+                
+    except KeyboardInterrupt:
+        click.echo("\n👋 Stopped watching")
+
+if __name__ == '__main__':
+    cli() 
