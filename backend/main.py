@@ -33,6 +33,38 @@ def safe_display_body(body_bytes: bytes) -> dict:
             "body_length": len(body_bytes)
         }
 
+def parse_prefix_server(prefix_input: str, format_type: str = 'utf8') -> str:
+    """
+    Server-side prefix parsing with mandatory 64-bit padding.
+    This prevents clients from blanket subscribing with short prefixes.
+    """
+    if format_type == 'utf8':
+        prefix_bytes = prefix_input.encode('utf-8')
+    elif format_type == 'hex':
+        try:
+            clean_hex = prefix_input.replace(' ', '').replace('-', '').replace(':', '')
+            prefix_bytes = bytes.fromhex(clean_hex)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid hex format")
+    elif format_type == 'base64':
+        try:
+            prefix_bytes = base64.b64decode(prefix_input)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid base64 format")
+    else:
+        raise HTTPException(status_code=400, detail="Unknown format type")
+    
+    if len(prefix_bytes) > 8:
+        raise HTTPException(status_code=400, detail="Prefix too long (max 8 bytes)")
+    
+    # MANDATORY 64-bit padding on server side
+    padded_bytes = prefix_bytes + b'\x00' * (8 - len(prefix_bytes))
+    return padded_bytes.hex()
+
+def matches_prefix(event_id: str, prefix_hex: str) -> bool:
+    """Check if event ID starts with the given prefix."""
+    return event_id.lower().startswith(prefix_hex.lower())
+
 # Create tables on startup
 @app.on_event("startup")
 def startup():
@@ -77,6 +109,10 @@ async def create_event(event: EventCreate, current_agent=Depends(get_current_age
     if prefix_to_use:
         try:
             prefix_bytes = bytes.fromhex(prefix_to_use)
+            # Pad prefix to 64 bits (8 bytes) to match watch behavior
+            if len(prefix_bytes) > 8:
+                raise HTTPException(status_code=400, detail="Prefix too long (max 8 bytes)")
+            prefix_bytes = prefix_bytes + b'\x00' * (8 - len(prefix_bytes))
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid prefix format")
     
@@ -97,6 +133,56 @@ async def create_event(event: EventCreate, current_agent=Depends(get_current_age
         "id": new_event.id,
         "agent_id": new_event.agent_id,
         "timestamp": new_event.timestamp.isoformat() + 'Z'
+    }
+
+@app.get("/events/watch")
+async def watch_events(
+    prefix: str = Query(..., description="Prefix to watch for"),
+    prefix_format: str = Query('utf8', description="Format of prefix: utf8, hex, or base64"),
+    since: Optional[str] = Query(None, description="Return events after this timestamp"),
+    limit: int = Query(100, description="Number of events to return"),
+    current_agent=Depends(get_current_agent), 
+    db: Session = Depends(get_db)
+):
+    """Watch for events with specific prefix (server-side filtering with mandatory 64-bit padding)"""
+    
+    # Server-side prefix parsing with mandatory padding
+    try:
+        padded_prefix_hex = parse_prefix_server(prefix, prefix_format)
+    except HTTPException:
+        raise
+    
+    # Build query
+    query = db.query(Event).order_by(Event.timestamp.desc())
+    
+    if since:
+        try:
+            since_dt = datetime.fromisoformat(since.replace('Z', '+00:00'))
+            query = query.filter(Event.timestamp > since_dt)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid timestamp format")
+    
+    # Get all events and filter by prefix
+    events = query.limit(1000).all()  # Get more events for filtering
+    
+    # Filter events by prefix
+    matching_events = []
+    for event in events:
+        if matches_prefix(event.id, padded_prefix_hex):
+            matching_events.append({
+                "id": event.id,
+                "agent_id": event.agent_id,
+                "timestamp": event.timestamp.isoformat() + 'Z',
+                "body_length": len(event.body) if event.body else 0
+            })
+            
+        # Stop if we have enough matching events
+        if len(matching_events) >= limit:
+            break
+    
+    return {
+        "prefix_used": padded_prefix_hex,
+        "events": matching_events
     }
 
 @app.get("/events/{event_id}")

@@ -39,15 +39,7 @@ def save_token(token):
 def parse_prefix(prefix_input: str, format_type: str = 'utf8') -> str:
     """
     Parse prefix input and convert to hex string (up to 8 bytes).
-    Pads with zeros on the right side if needed for watch, 
-    but for agent/event creation, uses actual length.
-    
-    Args:
-        prefix_input: The input prefix string
-        format_type: 'utf8', 'hex', or 'base64'
-    
-    Returns:
-        hex string (up to 16 characters for 8 bytes)
+    Used for agent/event creation (no padding).
     """
     if format_type == 'utf8':
         # Convert UTF-8 string to bytes
@@ -74,21 +66,6 @@ def parse_prefix(prefix_input: str, format_type: str = 'utf8') -> str:
     
     # Convert to hex string (no padding for agent/event creation)
     return prefix_bytes.hex()
-
-def parse_prefix_for_watch(prefix_input: str, format_type: str = 'utf8') -> str:
-    """
-    Parse prefix for watch command - always pads to 64 bits.
-    """
-    prefix_hex = parse_prefix(prefix_input, format_type)
-    prefix_bytes = bytes.fromhex(prefix_hex)
-    
-    # Pad with zeros on the right to make 8 bytes (64 bits) for watch
-    padded_bytes = prefix_bytes + b'\x00' * (8 - len(prefix_bytes))
-    return padded_bytes.hex()
-
-def matches_prefix(event_id: str, prefix_hex: str) -> bool:
-    """Check if event ID starts with the given prefix."""
-    return event_id.lower().startswith(prefix_hex.lower())
 
 def add_event_with_prefix(message: str, prefix: str = None, format_type: str = 'utf8'):
     """Add an event, optionally with a prefix override."""
@@ -252,40 +229,42 @@ def events():
 @click.option('--hex', 'format_type', flag_value='hex', help='Interpret prefix as hex')
 @click.option('--base64', 'format_type', flag_value='base64', help='Interpret prefix as base64')
 def watch(prefix, format_type):
-    """Watch for new events with specific 64-bit prefix (UTF-8 by default)"""
+    """Watch for new events with specific prefix (server enforces 64-bit padding)"""
     
     # Default to UTF-8 if no format specified
     if format_type is None:
         format_type = 'utf8'
     
-    try:
-        # Parse and pad prefix to 64 bits for watching
-        prefix_hex = parse_prefix_for_watch(prefix, format_type)
-        
-        click.echo(f"👀 Watching for events with prefix: {prefix_hex} ({format_type} input: '{prefix}')")
-        click.echo("   (Ctrl+C to stop)")
-        
-    except click.ClickException as e:
-        click.echo(f"❌ {e}", err=True)
-        sys.exit(1)
+    click.echo(f"👀 Watching for events with prefix: '{prefix}' ({format_type} format)")
+    click.echo("   Server will pad to 64-bits. (Ctrl+C to stop)")
     
     last_timestamp = None
     try:
         while True:
             try:
-                params = {}
+                # Use server-side filtering endpoint
+                params = {
+                    'prefix': prefix,
+                    'prefix_format': format_type,
+                    'limit': 100
+                }
                 if last_timestamp:
                     params['since'] = last_timestamp
                 
-                events = make_request("GET", "/events", params=params)
+                result = make_request("GET", "/events/watch", params=params)
                 
-                # Filter events by prefix and process in reverse order (oldest first)
+                # Show the padded prefix from server on first run
+                if last_timestamp is None:
+                    click.echo(f"   Padded prefix: {result['prefix_used']}")
+                
+                events = result['events']
+                
+                # Process events in reverse order (oldest first)
                 for event in reversed(events):
-                    if matches_prefix(event['id'], prefix_hex):
-                        event_time = event['timestamp']
-                        if last_timestamp is None or event_time > last_timestamp:
-                            click.echo(f"🔴 {event_time} | {event['agent_id']} | {event['body_length']} bytes | {event['id']}")
-                            last_timestamp = event_time
+                    event_time = event['timestamp']
+                    if last_timestamp is None or event_time > last_timestamp:
+                        click.echo(f"🔴 {event_time} | {event['agent_id']} | {event['body_length']} bytes | {event['id']}")
+                        last_timestamp = event_time
                 
                 # Update timestamp even if no matching events found
                 if events:
