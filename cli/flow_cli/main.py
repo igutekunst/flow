@@ -716,7 +716,7 @@ async def nc_listen_websocket(prefix_or_topic: str):
     token = load_token()
     
     if not token:
-        click.echo("❌ Not logged in. Use 'flow login' first", err=True)
+        click.echo("# Error: Not logged in. Use 'flow login' first", err=True)
         sys.exit(1)
     
     # Determine if this is a topic path or raw hex prefix
