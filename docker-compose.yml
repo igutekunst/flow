@@ -16,7 +16,7 @@ services:
       - "2222:8000"
     environment:
       DATABASE_URL: postgresql://flow_user:flow_pass@postgres:5432/supercortex_flow
-      INIT_ADMIN_TOKEN: admin_bootstrap_token_change_me
+      FLOW_ADMIN_TOKEN: ${FLOW_ADMIN_TOKEN}
     depends_on:
       - postgres
     volumes:

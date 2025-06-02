@@ -10,7 +10,11 @@ import base64
 
 app = FastAPI(title="SuperCortex Flow", description="Event Ingestion System")
 
-INIT_ADMIN_TOKEN = os.getenv("INIT_ADMIN_TOKEN", "admin_bootstrap_token_change_me")
+# Validate admin token is set in environment
+FLOW_ADMIN_TOKEN = os.getenv("FLOW_ADMIN_TOKEN")
+if not FLOW_ADMIN_TOKEN:
+    raise ValueError("FLOW_ADMIN_TOKEN must be set in the environment")
+
 
 def safe_display_body(body_bytes: bytes) -> dict:
     """
@@ -89,7 +93,7 @@ def get_current_agent(authorization: Optional[str] = Header(None), db: Session =
     token = authorization.replace("Bearer ", "")
     
     # Check if it's the admin token
-    if token == INIT_ADMIN_TOKEN:
+    if token == FLOW_ADMIN_TOKEN:
         return {"id": "admin", "is_admin": True, "prefix": None}
     
     # Check if it's a valid agent token
