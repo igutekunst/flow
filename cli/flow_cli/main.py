@@ -197,9 +197,6 @@ def cli(ctx, topic):
 @cli.command()
 def login():
     """Login with server URL and token"""
-    # Prompt for user
-    user = click.prompt('User')
-    
     # Prompt for server URL with default
     server_url = click.prompt(
         'Server URL',
@@ -220,11 +217,10 @@ def login():
     # Save both config and token
     config = load_config()
     config["base_url"] = server_url
-    config["user"] = user
     save_config(config)
     save_token(token)
     
-    click.echo(f"✓ Logged in successfully as {user} to {server_url}")
+    click.echo(f"✓ Logged in successfully to {server_url}")
 
 @cli.group()
 def config():
@@ -274,7 +270,6 @@ def show_config():
     client_secret = load_client_secret()
     
     click.echo("Current configuration:")
-    click.echo(f"  User: {config_data.get('user', 'Not set')}")
     click.echo(f"  Server: {config_data.get('base_url', 'Not set')}")
     click.echo(f"  Default Org: {config_data.get('default_org_id', 'Not set')}")
     click.echo(f"  Client Secret: {'Set' if client_secret else 'Not set'}")
