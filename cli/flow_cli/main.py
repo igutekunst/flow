@@ -280,6 +280,20 @@ def show_config():
         for alias, org_id in aliases.items():
             click.echo(f"    {alias}: {org_id}")
 
+@config.command("show-token")
+def show_token():
+    """Show the current authentication token"""
+    token = load_token()
+    
+    if not token:
+        click.echo("❌ No token found. Run 'flow login' first", err=True)
+        sys.exit(1)
+    
+    click.echo("Current authentication token:")
+    click.echo(f"  {token}")
+    click.echo("")
+    click.echo("⚠️  Keep this token secure - it provides access to your organization")
+
 @config.command("set-org")  
 @click.argument('org_alias')
 def set_org(org_alias):
