@@ -368,6 +368,25 @@ async def create_agent(agent_data: AgentCreate, current_agent=Depends(get_curren
         token=new_agent.token
     )
 
+@app.get("/agents")
+async def list_agents(current_agent=Depends(get_current_agent), db: Session = Depends(get_db)):
+    """List all agents (admin only)"""
+    if not current_agent.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Only admin can list agents")
+    
+    agents = db.query(Agent).all()
+    
+    return {
+        "agents": [
+            {
+                "id": agent.id,
+                "created_by": agent.created_by,
+                "created_at": agent.created_at.isoformat() + 'Z' if hasattr(agent, 'created_at') else None
+            }
+            for agent in agents
+        ]
+    }
+
 @app.get("/health")
 async def health():
     return {"status": "healthy"} 

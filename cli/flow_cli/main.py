@@ -440,22 +440,56 @@ def get(event_id):
         click.echo(f"❌ Error: {e}", err=True)
         sys.exit(1)
 
-@cli.command("agent")
-@click.argument('subcommand')
-def agent_cmd(subcommand):
-    """Agent management"""
-    if subcommand == "create":
-        try:
-            result = make_request("POST", "/agents", {})
-            click.echo(f"✓ Agent created:")
-            click.echo(f"  ID: {result['id']}")
-            click.echo(f"  Token: {result['token']}")
-            click.echo(f"  Topic keys will be derived from token")
-        except Exception as e:
-            click.echo(f"❌ Error: {e}", err=True)
-            sys.exit(1)
-    else:
-        click.echo(f"❌ Unknown agent subcommand: {subcommand}", err=True)
+@cli.group()
+def agent():
+    """Agent management (admin only)"""
+    pass
+
+@agent.command("create")
+def create_agent():
+    """Create a new agent/user (admin only)"""
+    try:
+        result = make_request("POST", "/agents", {})
+        click.echo(f"✓ Agent created:")
+        click.echo(f"  ID: {result['id']}")
+        click.echo(f"  Token: {result['token']}")
+        click.echo("")
+        click.echo("🔑 Share this token with the new user for login")
+        click.echo("💡 They can use: flow login")
+    except Exception as e:
+        click.echo(f"❌ Error: {e}", err=True)
+        if "403" in str(e) or "Only admin" in str(e):
+            click.echo("   (Only admin users can create new agents)", err=True)
+        sys.exit(1)
+
+@agent.command("list")
+def list_agents():
+    """List all agents (admin only)"""
+    try:
+        result = make_request("GET", "/agents")
+        agents = result.get("agents", [])
+        
+        if not agents:
+            click.echo("📭 No agents found")
+            return
+        
+        click.echo(f"👥 Found {len(agents)} agent(s):")
+        click.echo("")
+        
+        for agent in agents:
+            created_by = agent.get('created_by', 'unknown')
+            created_at = agent.get('created_at', 'unknown')
+            click.echo(f"🔑 Agent ID: {agent['id']}")
+            click.echo(f"   Created by: {created_by}")
+            if created_at != 'unknown':
+                click.echo(f"   Created at: {created_at}")
+            click.echo("")
+            
+    except Exception as e:
+        click.echo(f"❌ Error: {e}", err=True)
+        if "403" in str(e) or "Only admin" in str(e):
+            click.echo("   (Only admin users can list agents)", err=True)
+        sys.exit(1)
 
 @cli.command("share-topic")
 @click.argument('topic_path')
