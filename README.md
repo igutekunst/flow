@@ -60,8 +60,10 @@ make install-cli-only
 
 ### 3. Authentication & Basic Usage
 ```bash
-# Login with admin token
-flow login admin_bootstrap_token_change_me
+# Login with interactive prompts
+flow login
+# Server URL [http://localhost:2222]: 
+# Token: [hidden input]
 
 # Create a new agent (gets its own token)
 flow agent create
@@ -73,9 +75,6 @@ flow add "Secret message" -p alice
 # Watch for events matching a prefix (requires 64-bit minimum)
 flow watch isaac     # Watches for events with "isaac" prefix
 flow watch alice     # Watches for events with "alice" prefix
-
-# List recent events
-flow events
 ```
 
 ### 4. Understanding Prefix-Based Addressing
@@ -99,11 +98,10 @@ flow add "test" -p isaac
 
 ### CLI (`flow` command)
 ```bash
-flow login <token>              # Authenticate with admin or agent token
+flow login                      # Interactive login (prompts for server & token)
 flow agent create               # Create new agent (admin only)
 flow add "message" -p <prefix>  # Add event with optional prefix
 flow watch <prefix>             # Real-time prefix-based filtering
-flow events                     # List recent events
 flow get <event_id>             # Retrieve specific event
 ```
 
@@ -113,7 +111,7 @@ from supercortex_flow import FlowClient
 
 client = FlowClient(token="your_token")
 result = client.add_event("Hello from Python!")
-events = client.list_events()
+agent = client.create_agent()  # Get new agent ID and token
 ```
 
 ## 🔐 Security Model
@@ -122,6 +120,7 @@ events = client.list_events()
 - **Token-based authentication** for development
 - **64-bit minimum prefix length** prevents broad scanning
 - **Unguessable IDs** prevent message enumeration
+- **No event listing** - you can only access events by ID or prefix watch
 
 ### Full Vision Security
 - **Zero-knowledge proofs** for subscription requests

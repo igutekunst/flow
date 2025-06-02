@@ -85,7 +85,7 @@ def add_event_with_prefix(message: str, prefix: str = None, format_type: str = '
 def make_request(method, endpoint, data=None, params=None):
     token = load_token()
     if not token:
-        click.echo("❌ Not logged in. Use 'flow login <token>' first", err=True)
+        click.echo("❌ Not logged in. Use 'flow login' first", err=True)
         sys.exit(1)
     
     config = load_config()
@@ -132,11 +132,27 @@ def cli(ctx, prefix, prefix_format):
             click.echo(ctx.get_help())
 
 @cli.command()
-@click.argument('token')
-def login(token):
-    """Login with admin token or agent token"""
+def login():
+    """Login with server URL and token"""
+    # Prompt for server URL with default
+    server_url = click.prompt(
+        'Server URL',
+        default='http://localhost:2222',
+        show_default=True
+    ).rstrip('/')
+    
+    # Prompt for token with no default
+    token = click.prompt(
+        'Token',
+        hide_input=True
+    )
+    
+    # Save both config and token
+    config = {"base_url": server_url}
+    save_config(config)
     save_token(token)
-    click.echo("✓ Logged in successfully")
+    
+    click.echo(f"✓ Logged in successfully to {server_url}")
 
 @cli.command()
 @click.argument('message')
@@ -208,21 +224,6 @@ def agent_cmd(subcommand, prefix, prefix_format):
             sys.exit(1)
     else:
         click.echo(f"❌ Unknown agent subcommand: {subcommand}", err=True)
-
-@cli.command()
-def events():
-    """List recent events"""
-    try:
-        events = make_request("GET", "/events")
-        if not events:
-            click.echo("No events found")
-            return
-        
-        for event in events:
-            click.echo(f"{event['timestamp']} | {event['agent_id']} | {event['body_length']} bytes | {event['id']}")
-    except Exception as e:
-        click.echo(f"❌ Error: {e}", err=True)
-        sys.exit(1)
 
 @cli.command()
 @click.argument('prefix', required=True)

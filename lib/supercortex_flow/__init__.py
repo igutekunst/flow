@@ -27,10 +27,4 @@ class FlowClient:
         """Create a new agent (returns id and token)"""
         response = self.session.post(f"{self.base_url}/agents", json={})
         response.raise_for_status()
-        return response.json()
-    
-    def list_events(self) -> list:
-        """List recent events"""
-        response = self.session.get(f"{self.base_url}/events")
-        response.raise_for_status()
         return response.json() 

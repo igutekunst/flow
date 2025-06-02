@@ -238,34 +238,6 @@ async def create_agent(agent_data: AgentCreate, current_agent=Depends(get_curren
     
     return AgentResponse(id=new_agent.id, token=new_agent.token, prefix=new_agent.prefix)
 
-@app.get("/events")
-async def list_events(
-    current_agent=Depends(get_current_agent), 
-    db: Session = Depends(get_db),
-    since: Optional[str] = Query(None, description="Return events after this timestamp"),
-    limit: int = Query(100, description="Number of events to return")
-):
-    """List events (for debugging)"""
-    query = db.query(Event).order_by(Event.timestamp.desc())
-    
-    if since:
-        try:
-            since_dt = datetime.fromisoformat(since.replace('Z', '+00:00'))
-            query = query.filter(Event.timestamp > since_dt)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid timestamp format")
-    
-    events = query.limit(limit).all()
-    return [
-        {
-            "id": event.id,
-            "agent_id": event.agent_id, 
-            "timestamp": event.timestamp.isoformat() + 'Z',
-            "body_length": len(event.body) if event.body else 0
-        } 
-        for event in events
-    ]
-
 @app.get("/health")
 async def health():
     return {"status": "healthy"} 

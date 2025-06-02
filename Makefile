@@ -21,7 +21,8 @@ install-cli-only:
 
 test-flow:
 	@echo "Testing basic flow..."
-	flow login admin_bootstrap_token_change_me
-	flow agent create
-	flow add "Hello from the CLI!"
-	flow events 
+	@echo "⚠️  Note: Login is now interactive. Run manually:"
+	@echo "  flow login  # Enter server URL and token when prompted"
+	@echo "  flow agent create"
+	@echo "  flow add \"Hello from the CLI!\""
+	@echo "  flow watch <prefix>  # Watch for events with specific prefix" 
