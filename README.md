@@ -71,9 +71,18 @@ docker compose up -d
 ```
 
 ### 2. Install CLI
+
+#### Option A: From PyPI (Recommended)
+```bash
+pip install flow-pubsub-cli
+```
+
+#### Option B: Development Install
 ```bash
 make install-cli-only
 ```
+
+📦 **PyPI Package**: https://pypi.org/project/flow-pubsub-cli/
 
 ### 3. Setup & Authentication
 ```bash

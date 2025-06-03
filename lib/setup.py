@@ -6,6 +6,8 @@ setup(
     packages=find_packages(),
     install_requires=[
         "requests>=2.31.0",
+        "websockets>=12.0",
+        "aiohttp>=3.8.0",
     ],
     python_requires=">=3.8",
 ) 
